@@ -90,7 +90,7 @@ def esc(session_factory: sessionmaker[Session]) -> Iterator[Escenario]:
             yield s
 
     app.dependency_overrides[get_session] = sesion
-    with TestClient(app, raise_server_exceptions=False) as client:
+    with TestClient(app, raise_server_exceptions=False, client=("203.0.113.10", 50000)) as client:
         yield Escenario(client, p, test_key, live_key)
 
 
@@ -339,3 +339,99 @@ def test_error_interno_no_filtra_detalles(esc: Escenario, monkeypatch: pytest.Mo
     r = esc.post()
     assert r.status_code == 500
     assert r.json() == {"error": "internal_error", "message": "Error interno del gateway"}
+
+
+# --- Lista de IPs y rate limiting -------------------------------------------------------------
+
+
+def _producto(factory: sessionmaker[Session], product_id: int, **campos: object) -> None:
+    with factory() as s:
+        p = s.get_one(Product, product_id)
+        for k, v in campos.items():
+            setattr(p, k, v)
+        s.commit()
+
+
+@pytest.mark.parametrize(
+    ("lista", "permitida"),
+    [
+        (None, True),
+        (["203.0.113.10/32"], True),
+        (["203.0.113.0/24"], True),
+        (["198.51.100.0/24", "203.0.113.10/32"], True),
+        (["198.51.100.7/32"], False),
+        (["2001:db8::/32"], False),
+    ],
+)
+def test_lista_de_ips(
+    esc: Escenario, session_factory: sessionmaker[Session], lista: list[str] | None, permitida: bool
+) -> None:
+    import ipaddress
+
+    redes = [ipaddress.ip_network(r) for r in lista] if lista else None
+    _producto(session_factory, esc.product.id, allowed_ips=redes)
+    r = esc.post()
+    if permitida:
+        assert r.status_code == 202
+    else:
+        assert (r.status_code, r.json()["error"]) == (403, "ip_not_allowed")
+        assert "203.0.113.10" in r.json()["message"]
+        assert _contar(session_factory) == 0
+
+
+def test_rate_limit_por_producto(esc: Escenario, session_factory: sessionmaker[Session]) -> None:
+    _producto(session_factory, esc.product.id, rate_limit_per_minute=3)
+    codigos = [esc.post({**BODY, "external_ref": f"ref-{i}"}).status_code for i in range(3)]
+    assert codigos == [202, 202, 202]
+    r = esc.client.get("/v1/rewards", headers=_auth(esc.test_key))
+    assert (r.status_code, r.json()["error"]) == (429, "rate_limited")
+    assert 1 <= int(r.headers["Retry-After"]) <= 60
+    assert esc.post({**BODY, "external_ref": "ref-9"}).status_code == 429
+    assert _contar(session_factory) == 3
+
+
+def test_rate_limit_concurrente_es_exacto(
+    esc: Escenario, session_factory: sessionmaker[Session]
+) -> None:
+    _producto(session_factory, esc.product.id, rate_limit_per_minute=5)
+    barrera = threading.Barrier(12)
+    codigos: list[int] = []
+    candado = threading.Lock()
+
+    def pedir() -> None:
+        barrera.wait()
+        r = esc.client.get("/v1/rewards", headers=_auth(esc.test_key))
+        with candado:
+            codigos.append(r.status_code)
+
+    hilos = [threading.Thread(target=pedir) for _ in range(12)]
+    for h in hilos:
+        h.start()
+    for h in hilos:
+        h.join()
+    # Si el minuto cambia durante la prueba podrían pasar más; con 12 hilos no ocurre.
+    assert codigos.count(200) == 5 and codigos.count(429) == 7
+
+
+def test_rate_limit_se_reinicia_cada_minuto(
+    esc: Escenario, session_factory: sessionmaker[Session]
+) -> None:
+    from app.api.limits import consume
+
+    with session_factory() as s:
+        p = s.get_one(Product, esc.product.id)
+        p.rate_limit_per_minute = 1
+        t0 = datetime(2026, 11, 23, 20, 0, 30, tzinfo=UTC)
+        assert consume(s, p, t0) == (True, 30)
+        assert consume(s, p, t0.replace(second=59))[0] is False
+        assert consume(s, p, t0.replace(minute=1, second=0)) == (True, 60)
+        s.commit()
+
+
+def test_llave_invalida_no_consume_limite(
+    esc: Escenario, session_factory: sessionmaker[Session]
+) -> None:
+    _producto(session_factory, esc.product.id, rate_limit_per_minute=1)
+    for _ in range(5):
+        esc.client.get("/v1/rewards", headers=_auth("sk_test_" + "b" * 32))
+    assert esc.client.get("/v1/rewards", headers=_auth(esc.test_key)).status_code == 200

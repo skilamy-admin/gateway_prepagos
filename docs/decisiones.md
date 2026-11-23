@@ -18,7 +18,15 @@ Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reci
 - **Respuesta de consulta:**
   - campos: `id`, `external_ref`, `status`, `env`, `reward_code`, `amount` (número JSON), `currency`, `phone`, `error_code`, `created_at` y `finalized_at`;
   - `error_code` es el código de Prepaynation y solo aparece si la recarga terminó en FAILED.
-- **No incluido en esta fase** (PRD, no está en el brief de fase 1): rate limiting por llave y lista de IPs permitidas por producto (la columna `allowed_ips` ya existe).
+- **Rate limiting y lista de IPs, adelantados a la fase 1** a pedido de Skilamy (2026-11-23):
+  - **Rate limiting por producto** (suma de todas sus llaves; el PRD dice «por llave»):
+    - `products.rate_limit_per_minute`, 60 por defecto, se cambia con `gateway product set-rate-limit`;
+    - contador por minuto en la tabla `api_rate_windows`, incrementado con un UPSERT atómico. No hace falta Redis y funciona con varios procesos de la API;
+    - al superarlo responde 429 `rate_limited` con `Retry-After`. Las llaves inválidas no consumen el límite del producto.
+  - **Lista de IPs** (`products.allowed_ips`, IP o red CIDR, se cambia con `gateway product set-ips`):
+    - vacía = cualquier IP; con lista, otra IP recibe 403 `ip_not_allowed` (código nuevo);
+    - la IP real la entrega Nginx. En el paso 8, Nginx debe **reemplazar** `X-Forwarded-For` con `$remote_addr` (no agregarle), y uvicorn solo confía en 127.0.0.1. Si no, un cliente podría falsear su IP.
+  - Defensa adicional prevista para el paso 8: `limit_req` de Nginx por IP antes de llegar a la API.
 
 **Pregunta abierta para Skilamy:** la única es `(product_id, external_ref)`, como dicen el PRD y el CLAUDE.md, así que test y live comparten el espacio de `external_ref`. Si un producto prueba con `user_123:curso_7` en sandbox y después pide lo mismo en producción, hoy recibe 409 `external_ref_conflict` en lugar de pagar. Así no se paga dos veces ni se pierde la recompensa en silencio, pero obliga a los productos a usar referencias distintas en test. Alternativa: hacer la única `(product_id, env, external_ref)`. Requiere aprobación porque cambia una regla de idempotencia.
 

@@ -209,3 +209,22 @@ def test_reward_valida_contra_catalogo(producto_cr: str, session: Session) -> No
     assert "Sin SKU para: Claro" in parcial
     _reward(producto_cr, "2000", "--allow-partial")
     assert sorted(r.code for r in session.scalars(select(Reward))) == ["R2000", "R5000"]
+
+
+def test_product_set_ips_y_rate_limit(producto: str, session: Session) -> None:
+    gw("product", "set-ips", producto, "--ip", "203.0.113.10", "--ip", "198.51.100.0/24")
+    ips = session.scalars(select(Product.allowed_ips)).one()
+    assert [str(r) for r in ips or []] == ["203.0.113.10/32", "198.51.100.0/24"]
+    gw("product", "set-ips", producto, "--ip", "999.1.1.1", ok=False)
+    gw("product", "set-ips", producto, "--ip", "198.51.100.7/24", ok=False)  # bits de host
+    gw("product", "set-ips", producto, ok=False)
+    gw("product", "set-rate-limit", producto, "20")
+    gw("product", "set-rate-limit", producto, "0", ok=False)
+    show = gw("product", "show", producto)
+    assert "203.0.113.10/32" in show and "20" in show
+    gw("product", "set-ips", producto, "--clear")
+    session.expire_all()
+    assert session.scalars(select(Product.allowed_ips)).one() is None
+    assert "cualquiera" in gw("product", "show", producto)
+    acciones = [a.action for a in session.scalars(select(AuditLog))]
+    assert acciones.count("product.set_ips") == 2 and "product.set_rate_limit" in acciones

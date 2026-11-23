@@ -10,6 +10,7 @@ Las reglas que protegen dinero viven en la base, no solo en el código:
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+from ipaddress import IPv4Network, IPv6Network
 from typing import Any
 
 from sqlalchemy import (
@@ -32,6 +33,8 @@ from sqlalchemy.dialects.postgresql import ARRAY, CIDR, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+
+type IPNetwork = IPv4Network | IPv6Network
 
 # --- Enumeraciones ---------------------------------------------------------------------------
 
@@ -113,6 +116,7 @@ class Product(Base):
         CheckConstraint(
             "per_phone_window_days IS NULL OR per_phone_window_days > 0", name="window_days_pos"
         ),
+        CheckConstraint("rate_limit_per_minute > 0", name="rate_limit_positive"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -125,16 +129,32 @@ class Product(Base):
     webhook_url: Mapped[str | None] = mapped_column(String(500))
     # Secreto HMAC del webhook, cifrado con Fernet (no se guarda en claro).
     webhook_secret_enc: Mapped[bytes | None] = mapped_column(LargeBinary)
-    allowed_ips: Mapped[list[str] | None] = mapped_column(ARRAY(CIDR))
+    allowed_ips: Mapped[list[IPNetwork] | None] = mapped_column(ARRAY(CIDR))
     # Topes de presupuesto (fase 2). Moneda: ver docs/decisiones.md.
     daily_cap: Mapped[Decimal | None] = mapped_column(Money)
     monthly_cap: Mapped[Decimal | None] = mapped_column(Money)
     max_per_phone: Mapped[int | None] = mapped_column(Integer)
     per_phone_window_days: Mapped[int | None] = mapped_column(Integer)
+    # Máximo de solicitudes por minuto a la API, sumando todas las llaves del producto.
+    rate_limit_per_minute: Mapped[int] = mapped_column(Integer, server_default="60")
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class ApiRateWindow(Base):
+    """Contador de solicitudes por producto y minuto (rate limiting sin Redis).
+
+    Una fila por producto y ventana de un minuto; se incrementa con un UPSERT atómico, así
+    funciona igual con varios procesos de la API.
+    """
+
+    __tablename__ = "api_rate_windows"
+
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    count: Mapped[int] = mapped_column(Integer)
 
 
 class ApiKey(Base):

@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError
+from app.api.limits import consume, ip_allowed
 from app.db import get_session
 from app.models import ApiKey, Env, Product, ProductStatus
 from app.security import env_of_key, hash_api_key, hashes_match
@@ -29,6 +30,7 @@ class AuthContext:
 
 
 def authenticate(
+    request: Request,
     session: Annotated[Session, Depends(get_session)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> AuthContext:
@@ -52,6 +54,19 @@ def authenticate(
             403, "product_suspended", "El producto está en test: las llaves live no se aceptan"
         )
 
+    # La IP real del cliente la entrega Nginx (uvicorn confía solo en 127.0.0.1).
+    ip = request.client.host if request.client else None
+    if not ip_allowed(producto, ip):
+        raise ApiError(403, "ip_not_allowed", f"La IP {ip} no está autorizada para este producto")
+
+    permitida, espera = consume(session, producto)
     registro.last_used_at = datetime.now(UTC)
     session.commit()
+    if not permitida:
+        raise ApiError(
+            429,
+            "rate_limited",
+            f"Límite de {producto.rate_limit_per_minute} solicitudes por minuto alcanzado",
+            headers={"Retry-After": str(espera)},
+        )
     return AuthContext(product=producto, env=registro.env, key_id=registro.id)

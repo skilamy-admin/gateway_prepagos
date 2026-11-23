@@ -4,6 +4,7 @@ Toda acción que cambia datos queda en audit_log (sin secretos).
 """
 
 import getpass
+import ipaddress
 import os
 import re
 from collections.abc import Iterator
@@ -298,6 +299,71 @@ def product_set_status(
 
 
 # --- Llaves -----------------------------------------------------------------------------------
+
+
+@product_app.command("show")
+def product_show(code: Annotated[str, typer.Argument()]) -> None:
+    """Muestra la configuración de un producto."""
+    with _session() as s:
+        p = _product(s, code)
+        filas = [
+            ("Código", p.code),
+            ("Nombre", p.name),
+            ("País", p.country_code),
+            ("Estado", p.status.value),
+            ("Límite por minuto", str(p.rate_limit_per_minute)),
+            ("IPs permitidas", ", ".join(map(str, p.allowed_ips or [])) or "cualquiera"),
+            ("Creado", _fecha(p.created_at)),
+        ]
+    for etiqueta, valor in filas:
+        typer.echo(f"{etiqueta + ':':20} {valor}")
+
+
+@product_app.command("set-ips")
+def product_set_ips(
+    code: Annotated[str, typer.Argument()],
+    ip: Annotated[
+        list[str] | None,
+        typer.Option("--ip", help="IP o red CIDR (repetible), p. ej. --ip 203.0.113.10"),
+    ] = None,
+    clear: Annotated[
+        bool, typer.Option("--clear", help="Quitar la lista: aceptar cualquier IP")
+    ] = False,
+) -> None:
+    """Define desde qué IPs puede llamar el producto. Reemplaza la lista anterior."""
+    if clear == bool(ip):
+        raise _fail("Indica una o más --ip, o --clear")
+    redes: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for valor in ip or []:
+        try:
+            redes.append(ipaddress.ip_network(valor.strip(), strict=True))
+        except ValueError:
+            raise _fail(f"«{valor}» no es una IP ni una red CIDR válida") from None
+    with _session() as s:
+        p = _product(s, code)
+        anterior = [str(r) for r in p.allowed_ips or []]
+        p.allowed_ips = redes or None
+        nuevas = [str(r) for r in redes]
+        _audit(s, "product.set_ips", "product", p.id, {"from": anterior, "to": nuevas})
+        s.commit()
+    typer.echo(f"«{code}»: " + (", ".join(nuevas) if nuevas else "acepta cualquier IP"))
+
+
+@product_app.command("set-rate-limit")
+def product_set_rate_limit(
+    code: Annotated[str, typer.Argument()],
+    per_minute: Annotated[int, typer.Argument(help="Solicitudes por minuto (todas sus llaves)")],
+) -> None:
+    """Cambia el límite de solicitudes por minuto del producto."""
+    if not 1 <= per_minute <= 10_000:
+        raise _fail("El límite debe estar entre 1 y 10000")
+    with _session() as s:
+        p = _product(s, code)
+        anterior = p.rate_limit_per_minute
+        p.rate_limit_per_minute = per_minute
+        _audit(s, "product.set_rate_limit", "product", p.id, {"from": anterior, "to": per_minute})
+        s.commit()
+    typer.echo(f"«{code}»: {anterior} → {per_minute} solicitudes por minuto")
 
 
 @key_app.command("create")
