@@ -45,7 +45,8 @@ uv run gateway --help            # CLI de administración
 
 ## Reglas del gateway
 
-- **Idempotencia por base de datos:** restricción única sobre (`product_id`, `external_ref`) y sobre `correlation_id`. No confiar en comprobaciones en código.
+- **Idempotencia por base de datos:** restricción única sobre (`product_id`, `env`, `external_ref`) y sobre `correlation_id`. No confiar en comprobaciones en código. (Se agregó `env` el 2026-11-23, con aprobación de Skilamy; ver `docs/decisiones.md`.)
+- **Topes de presupuesto (diario/mensual, en moneda local) y límite por teléfono** se evalúan al crear la recarga, con el producto bloqueado (`FOR UPDATE`). Cuentan todas las recargas no FAILED del mismo entorno.
 - **Máquina de estados:** `PENDING → SUBMITTED → SUCCESS | FAILED | UNKNOWN`, y `UNKNOWN → SUCCESS | FAILED` solo vía `/transaction/status`. Pasar a `SUBMITTED` y hacer commit **antes** de llamar a `topup`. Los estados finales no cambian nunca.
 - La cola es la tabla `topups` con `SELECT … FOR UPDATE SKIP LOCKED`. Sin Redis.
 - Cada llamada a Prepaynation se registra en `topup_events` (request/response sin credenciales, latencia).

@@ -29,7 +29,8 @@ def gw(*args: str, input: str | None = None, ok: bool = True) -> str:
 
 @pytest.fixture
 def jamaica() -> None:
-    gw("country", "add", "JM", "--name", "Jamaica", "--dial-prefix", "+1876", "--currency", "JMD")
+    gw("country", "add", "JM", "--name", "Jamaica", "--dial-prefix", "+1876", "--currency", "JMD",
+       "--timezone", "America/Jamaica")  # fmt: skip
 
 
 @pytest.fixture
@@ -48,6 +49,7 @@ def test_country_add_valida_prefijo() -> None:
 
 def test_country_duplicado(jamaica: None) -> None:
     out = gw("country", "add", "JM", "--name", "J", "--dial-prefix", "+1876", "--currency", "JMD",
+             "--timezone", "America/Jamaica",
              ok=False)  # fmt: skip
     assert "ya existe" in out
 
@@ -228,3 +230,34 @@ def test_product_set_ips_y_rate_limit(producto: str, session: Session) -> None:
     assert "cualquiera" in gw("product", "show", producto)
     acciones = [a.action for a in session.scalars(select(AuditLog))]
     assert acciones.count("product.set_ips") == 2 and "product.set_rate_limit" in acciones
+
+
+def test_country_zona_horaria(session: Session) -> None:
+    # Costa Rica tiene una sola zona: se deduce. Jamaica comparte +1: hay que indicarla.
+    assert "America/Costa_Rica" in gw(
+        "country", "add", "CR", "--name", "Costa Rica", "--dial-prefix", "+506", "--currency", "CRC"
+    )
+    gw("country", "add", "JM", "--name", "J", "--dial-prefix", "+1876", "--currency", "JMD",
+       ok=False)  # fmt: skip
+    gw("country", "add", "JM", "--name", "J", "--dial-prefix", "+1876", "--currency", "JMD",
+       "--timezone", "Marte/Olympus", ok=False)  # fmt: skip
+
+
+def test_product_set_caps_y_phone_limit(producto: str, session: Session) -> None:
+    gw("product", "set-caps", producto, "--daily", "50000", "--monthly", "500000")
+    gw("product", "set-caps", producto, "--daily", "600000", ok=False)  # diario > mensual
+    gw("product", "set-caps", producto, ok=False)
+    gw("product", "set-phone-limit", producto, "--max", "1", "--days", "30")
+    gw("product", "set-phone-limit", producto, "--max", "0", ok=False)
+    session.expire_all()
+    p = session.scalars(select(Product)).one()
+    assert (p.daily_cap, p.monthly_cap, p.max_per_phone, p.per_phone_window_days) == (
+        50000, 500000, 1, 30,
+    )  # fmt: skip
+    show = gw("product", "show", producto)
+    assert "50000" in show and "1 cada 30" in show and "usado" in show
+    gw("product", "set-caps", producto, "--clear")
+    gw("product", "set-phone-limit", producto, "--clear")
+    session.expire_all()
+    p = session.scalars(select(Product)).one()
+    assert (p.daily_cap, p.monthly_cap, p.max_per_phone) == (None, None, None)

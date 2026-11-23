@@ -1,15 +1,18 @@
 """Creación idempotente de recargas.
 
-La idempotencia la garantiza la base: restricción única (product_id, external_ref) +
+La idempotencia la garantiza la base: restricción única (product_id, env, external_ref) +
 INSERT … ON CONFLICT DO NOTHING. Dos solicitudes simultáneas producen una sola fila.
+Los topes de presupuesto y el límite por teléfono se evalúan con el producto bloqueado.
 """
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from app.domain.limits import LimitExceededError, check_limits
 from app.domain.phones import InvalidPhoneError, normalize_mobile
 from app.domain.rewards import talktime_skus
 from app.ids import new_correlation_id, new_topup_id
@@ -40,22 +43,16 @@ class CreateResult:
     created: bool
 
 
-def find_by_external_ref(session: Session, product_id: int, external_ref: str) -> Topup | None:
+def find_by_external_ref(
+    session: Session, product_id: int, env: Env, external_ref: str
+) -> Topup | None:
     return session.scalar(
-        select(Topup).where(Topup.product_id == product_id, Topup.external_ref == external_ref)
-    )
-
-
-def _existente(topup: Topup, env: Env) -> CreateResult:
-    if topup.env != env:
-        # La misma external_ref ya se usó en el otro entorno. Devolver esa transacción haría
-        # creer al producto que pagó (o que probó) cuando no es así.
-        raise TopupRejectedError(
-            "external_ref_conflict",
-            409,
-            f"external_ref ya fue usada con una llave de {topup.env.value}",
+        select(Topup).where(
+            Topup.product_id == product_id,
+            Topup.env == env,
+            Topup.external_ref == external_ref,
         )
-    return CreateResult(topup, created=False)
+    )
 
 
 def resolve_operator(session: Session, env: Env, country_code: str, nombre: str) -> str:
@@ -90,9 +87,9 @@ def create_topup(
     """
     # Primero la idempotencia: un reintento devuelve lo mismo aunque la recompensa
     # se haya desactivado después.
-    existente = find_by_external_ref(session, product.id, external_ref)
+    existente = find_by_external_ref(session, product.id, env, external_ref)
     if existente is not None:
-        return _existente(existente, env)
+        return CreateResult(existente, created=False)
 
     recompensa = session.scalar(
         select(Reward).where(
@@ -114,6 +111,30 @@ def create_topup(
     if operator is not None:
         operator_id = resolve_operator(session, env, pais.code, operator)
 
+    # Bloquear el producto: serializa las creaciones del producto para que los topes no se
+    # superen con solicitudes simultáneas. Se libera con el commit o el rollback.
+    session.execute(select(Product.id).where(Product.id == product.id).with_for_update())
+    # Mientras esperábamos el bloqueo pudo crearse la misma external_ref: devolver esa
+    # antes de evaluar topes (un reintento nunca debe recibir budget_exceeded).
+    existente = find_by_external_ref(session, product.id, env, external_ref)
+    if existente is not None:
+        session.commit()
+        return CreateResult(existente, created=False)
+    try:
+        check_limits(
+            session,
+            product=product,
+            env=env,
+            tz=pais.timezone,
+            phone=e164,
+            amount=recompensa.amount,
+            currency=recompensa.currency,
+            now=datetime.now(UTC),
+        )
+    except LimitExceededError as e:
+        session.rollback()
+        raise TopupRejectedError(e.code, 429, e.message) from None
+
     nuevo_id = session.execute(
         insert(Topup)
         .values(
@@ -129,17 +150,17 @@ def create_topup(
             currency=recompensa.currency,
             correlation_id=new_correlation_id(),
         )
-        .on_conflict_do_nothing(index_elements=["product_id", "external_ref"])
+        .on_conflict_do_nothing(index_elements=["product_id", "env", "external_ref"])
         .returning(Topup.id)
     ).scalar_one_or_none()
 
     if nuevo_id is None:
         # Otra solicitud con la misma external_ref ganó la carrera: devolver esa.
         session.rollback()
-        ganadora = find_by_external_ref(session, product.id, external_ref)
+        ganadora = find_by_external_ref(session, product.id, env, external_ref)
         if ganadora is None:  # pragma: no cover - imposible salvo borrado manual
             raise RuntimeError("conflicto de external_ref sin fila existente")
-        return _existente(ganadora, env)
+        return CreateResult(ganadora, created=False)
 
     session.add(
         TopupEvent(

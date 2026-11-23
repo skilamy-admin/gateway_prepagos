@@ -153,9 +153,18 @@ def test_llave_live_con_producto_live(
     with session_factory() as s:
         s.get_one(Product, esc.product.id).status = ProductStatus.LIVE
         s.commit()
-    r = esc.post(key=esc.live_key)
-    assert r.status_code == 202 and r.json()["env"] == "live"
-    assert esc.post().json()["error"] == "external_ref_conflict"  # misma ref con llave test
+    live = esc.post(key=esc.live_key)
+    assert live.status_code == 202 and live.json()["env"] == "live"
+    # La misma external_ref con la llave test es otra recarga, en sandbox.
+    test = esc.post()
+    assert test.status_code == 202 and test.json()["env"] == "test"
+    assert test.json()["id"] != live.json()["id"]
+    # Cada llave consulta la suya.
+    for llave, id_ in ((esc.live_key, live.json()["id"]), (esc.test_key, test.json()["id"])):
+        r = esc.client.get("/v1/topups", params={"external_ref": BODY["external_ref"]},
+                           headers=_auth(llave))  # fmt: skip
+        assert r.json()["id"] == id_
+    assert esc.post(key=esc.live_key).status_code == 200
 
 
 def test_last_used_at(esc: Escenario, session_factory: sessionmaker[Session]) -> None:
@@ -435,3 +444,85 @@ def test_llave_invalida_no_consume_limite(
     for _ in range(5):
         esc.client.get("/v1/rewards", headers=_auth("sk_test_" + "b" * 32))
     assert esc.client.get("/v1/rewards", headers=_auth(esc.test_key)).status_code == 200
+
+
+# --- Topes de presupuesto y límite por teléfono -----------------------------------------------
+
+
+def _fallar(factory: sessionmaker[Session], topup_id: str) -> None:
+    with factory() as s:
+        t = s.get_one(Topup, topup_id)
+        t.status = TopupStatus.FAILED
+        t.finalized_at = datetime.now(UTC)
+        s.commit()
+
+
+def _ref(i: int, **extra: str) -> dict[str, str]:
+    return {**BODY, "external_ref": f"ref-{i}", "phone": f"+1876555{i:04d}", **extra}
+
+
+def test_tope_diario(esc: Escenario, session_factory: sessionmaker[Session]) -> None:
+    _producto(session_factory, esc.product.id, daily_cap=Decimal(3200))  # 2 recompensas de 1600 JMD
+    assert [esc.post(_ref(i)).status_code for i in range(2)] == [202, 202]
+    r = esc.post(_ref(2))
+    assert (r.status_code, r.json()["error"]) == (429, "budget_exceeded")
+    assert "3200" in r.json()["message"]
+    assert _contar(session_factory) == 2
+    # Un reintento de una recarga existente nunca recibe budget_exceeded.
+    assert esc.post(_ref(0)).status_code == 200
+
+
+def test_tope_mensual(esc: Escenario, session_factory: sessionmaker[Session]) -> None:
+    _producto(session_factory, esc.product.id, monthly_cap=Decimal(1600))
+    assert esc.post(_ref(0)).status_code == 202
+    assert esc.post(_ref(1)).json()["error"] == "budget_exceeded"
+
+
+def test_las_fallidas_liberan_presupuesto(
+    esc: Escenario, session_factory: sessionmaker[Session]
+) -> None:
+    _producto(session_factory, esc.product.id, daily_cap=Decimal(1600))
+    _fallar(session_factory, esc.post(_ref(0)).json()["id"])
+    assert esc.post(_ref(1)).status_code == 202
+
+
+def test_tope_separado_por_entorno(esc: Escenario, session_factory: sessionmaker[Session]) -> None:
+    _producto(session_factory, esc.product.id, daily_cap=Decimal(1600), status=ProductStatus.LIVE)
+    assert esc.post(_ref(0)).status_code == 202  # sandbox
+    assert esc.post(_ref(1), key=esc.live_key).status_code == 202  # producción, su propio tope
+    assert esc.post(_ref(2), key=esc.live_key).json()["error"] == "budget_exceeded"
+
+
+def test_tope_con_solicitudes_simultaneas(
+    esc: Escenario, session_factory: sessionmaker[Session]
+) -> None:
+    _producto(session_factory, esc.product.id, daily_cap=Decimal(4800))  # 3 recompensas de 1600
+    barrera = threading.Barrier(10)
+    codigos: list[int] = []
+    candado = threading.Lock()
+
+    def pedir(i: int) -> None:
+        barrera.wait()
+        r = esc.post(_ref(i))
+        with candado:
+            codigos.append(r.status_code)
+
+    hilos = [threading.Thread(target=pedir, args=(i,)) for i in range(10)]
+    for h in hilos:
+        h.start()
+    for h in hilos:
+        h.join()
+    assert sorted(codigos) == [202] * 3 + [429] * 7
+    assert _contar(session_factory) == 3
+
+
+def test_limite_por_telefono(esc: Escenario, session_factory: sessionmaker[Session]) -> None:
+    _producto(session_factory, esc.product.id, max_per_phone=2, per_phone_window_days=30)
+    tel = {"phone": "+18765550123"}
+    assert esc.post(_ref(0, **tel)).status_code == 202
+    assert esc.post(_ref(1, **tel)).status_code == 202
+    r = esc.post(_ref(2, **tel))
+    assert (r.status_code, r.json()["error"]) == (429, "phone_limit_reached")
+    assert esc.post(_ref(3)).status_code == 202  # otro número
+    # Formato nacional del mismo número: se normaliza y también cuenta.
+    assert esc.post(_ref(4, phone="876-555-0123")).json()["error"] == "phone_limit_reached"

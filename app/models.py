@@ -104,6 +104,8 @@ class Country(Base):
     name: Mapped[str] = mapped_column(String(100))
     dial_prefix: Mapped[str] = mapped_column(String(8))  # +506, +1876
     currency: Mapped[str] = mapped_column(String(3))  # CRC, JMD
+    # Zona IANA: define cuándo empiezan el día y el mes de los topes de presupuesto.
+    timezone: Mapped[str] = mapped_column(String(50), server_default="UTC")
     active: Mapped[bool] = mapped_column(Boolean, server_default="true")
 
 
@@ -130,7 +132,8 @@ class Product(Base):
     # Secreto HMAC del webhook, cifrado con Fernet (no se guarda en claro).
     webhook_secret_enc: Mapped[bytes | None] = mapped_column(LargeBinary)
     allowed_ips: Mapped[list[IPNetwork] | None] = mapped_column(ARRAY(CIDR))
-    # Topes de presupuesto (fase 2). Moneda: ver docs/decisiones.md.
+    # Topes de presupuesto en la moneda local del país (CRC para Costa Rica). Cuentan todas
+    # las recargas del entorno que no terminaron en FAILED. NULL = sin tope.
     daily_cap: Mapped[Decimal | None] = mapped_column(Money)
     monthly_cap: Mapped[Decimal | None] = mapped_column(Money)
     max_per_phone: Mapped[int | None] = mapped_column(Integer)
@@ -202,7 +205,8 @@ class Reward(Base):
 class Topup(Base):
     __tablename__ = "topups"
     __table_args__ = (
-        UniqueConstraint("product_id", "external_ref"),
+        # Idempotencia por entorno: una prueba en sandbox no ocupa la referencia de producción.
+        UniqueConstraint("product_id", "env", "external_ref"),
         CheckConstraint("amount > 0", name="amount_positive"),
         CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_iso"),
         CheckConstraint("phone ~ '^\\+[1-9][0-9]{6,14}$'", name="phone_e164"),

@@ -13,8 +13,10 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import phonenumbers
+import phonenumbers.timezone
 import typer
 import uvicorn
 from sqlalchemy import func, select
@@ -23,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from app import __version__, db
 from app.config import get_settings
+from app.domain.limits import usage
 from app.domain.rewards import coverage, talktime_skus
 from app.models import (
     ApiKey,
@@ -188,9 +191,22 @@ def country_add(
     name: Annotated[str, typer.Option(help="Nombre, p. ej. «Costa Rica»")],
     dial_prefix: Annotated[str, typer.Option(help="Prefijo internacional, p. ej. +506 o +1876")],
     currency: Annotated[str, typer.Option(help="Moneda local ISO 4217, p. ej. CRC")],
+    timezone: Annotated[
+        str | None,
+        typer.Option(help="Zona IANA para los topes diarios, p. ej. America/Costa_Rica"),
+    ] = None,
 ) -> None:
     """Agrega un país."""
     code, currency = code.upper(), currency.upper()
+    if timezone is None:
+        zonas = _zonas_del_pais(code)
+        if len(zonas) != 1:
+            raise _fail(f"No se puede deducir la zona horaria de {code}: indica --timezone")
+        timezone = zonas[0]
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise _fail(f"«{timezone}» no es una zona horaria IANA válida") from None
     cc = phonenumbers.country_code_for_region(code)
     if cc == 0:
         raise _fail(f"«{code}» no es un código de país válido")
@@ -199,12 +215,22 @@ def country_add(
     if not re.fullmatch(r"[A-Z]{3}", currency):
         raise _fail("La moneda debe tener 3 letras (ISO 4217)")
     with _session() as s:
-        s.add(Country(code=code, name=name, dial_prefix=dial_prefix, currency=currency))
-        _audit(
-            s, "country.add", "country", code, {"dial_prefix": dial_prefix, "currency": currency}
+        s.add(
+            Country(
+                code=code, name=name, dial_prefix=dial_prefix, currency=currency, timezone=timezone
+            )
         )
+        _audit(
+            s, "country.add", "country", code,
+            {"dial_prefix": dial_prefix, "currency": currency, "timezone": timezone},
+        )  # fmt: skip
         _commit(s, f"El país {code} ya existe")
-    typer.echo(f"País {code} agregado")
+    typer.echo(f"País {code} agregado (zona {timezone})")
+
+
+def _zonas_del_pais(code: str) -> tuple[str, ...]:
+    ejemplo = phonenumbers.example_number_for_type(code, phonenumbers.PhoneNumberType.MOBILE)
+    return phonenumbers.timezone.time_zones_for_number(ejemplo) if ejemplo else ()
 
 
 @country_app.command("list")
@@ -306,17 +332,87 @@ def product_show(code: Annotated[str, typer.Argument()]) -> None:
     """Muestra la configuración de un producto."""
     with _session() as s:
         p = _product(s, code)
+        pais = s.get_one(Country, p.country_code)
+        ahora = datetime.now(UTC)
+        uso = {e: usage(s, p, e, pais.timezone, ahora) for e in Env}
+        mon = pais.currency
+
+        def tope(valor: Decimal | None, usado_live: Decimal, usado_test: Decimal) -> str:
+            limite = f"{valor} {mon}" if valor is not None else "sin tope"
+            return f"{limite} (usado hoy/mes live: {usado_live} {mon}, test: {usado_test} {mon})"
+
+        if p.max_per_phone is None:
+            por_tel = "sin límite"
+        else:
+            por_tel = f"{p.max_per_phone} cada {p.per_phone_window_days or 1} día(s)"
         filas = [
             ("Código", p.code),
             ("Nombre", p.name),
-            ("País", p.country_code),
+            ("País", f"{p.country_code} (zona {pais.timezone})"),
             ("Estado", p.status.value),
+            ("Tope diario", tope(p.daily_cap, uso[Env.LIVE].day, uso[Env.TEST].day)),
+            ("Tope mensual", tope(p.monthly_cap, uso[Env.LIVE].month, uso[Env.TEST].month)),
+            ("Por teléfono", por_tel),
             ("Límite por minuto", str(p.rate_limit_per_minute)),
             ("IPs permitidas", ", ".join(map(str, p.allowed_ips or [])) or "cualquiera"),
             ("Creado", _fecha(p.created_at)),
         ]
     for etiqueta, valor in filas:
         typer.echo(f"{etiqueta + ':':20} {valor}")
+
+
+@product_app.command("set-caps")
+def product_set_caps(
+    code: Annotated[str, typer.Argument()],
+    daily: Annotated[str | None, typer.Option(help="Tope diario en moneda local")] = None,
+    monthly: Annotated[str | None, typer.Option(help="Tope mensual en moneda local")] = None,
+    clear: Annotated[bool, typer.Option("--clear", help="Quitar ambos topes")] = False,
+) -> None:
+    """Topes de presupuesto en la moneda local del país (cuentan las recargas no fallidas)."""
+    if clear == (daily is not None or monthly is not None):
+        raise _fail("Indica --daily y/o --monthly, o --clear")
+    with _session() as s:
+        p = _product(s, code)
+        antes = {"daily": str(p.daily_cap), "monthly": str(p.monthly_cap)}
+        if clear:
+            p.daily_cap = p.monthly_cap = None
+        if daily is not None:
+            p.daily_cap = _monto(daily)
+        if monthly is not None:
+            p.monthly_cap = _monto(monthly)
+        if p.daily_cap and p.monthly_cap and p.daily_cap > p.monthly_cap:
+            raise _fail("El tope diario no puede ser mayor que el mensual")
+        despues = {"daily": str(p.daily_cap), "monthly": str(p.monthly_cap)}
+        _audit(s, "product.set_caps", "product", p.id, {"from": antes, "to": despues})
+        s.commit()
+    typer.echo(f"«{code}»: diario {despues['daily']}, mensual {despues['monthly']}")
+
+
+@product_app.command("set-phone-limit")
+def product_set_phone_limit(
+    code: Annotated[str, typer.Argument()],
+    max_: Annotated[int | None, typer.Option("--max", help="Recargas máximas por número")] = None,
+    days: Annotated[int, typer.Option(help="Ventana en días")] = 30,
+    clear: Annotated[bool, typer.Option("--clear", help="Quitar el límite")] = False,
+) -> None:
+    """Máximo de recargas por número de teléfono en una ventana de días."""
+    if clear == (max_ is not None):
+        raise _fail("Indica --max (y --days), o --clear")
+    if max_ is not None and (max_ < 1 or not 1 <= days <= 366):
+        raise _fail("--max debe ser al menos 1 y --days entre 1 y 366")
+    with _session() as s:
+        p = _product(s, code)
+        antes = {"max": p.max_per_phone, "days": p.per_phone_window_days}
+        p.max_per_phone = max_
+        p.per_phone_window_days = None if clear else days
+        despues = {"max": p.max_per_phone, "days": p.per_phone_window_days}
+        _audit(s, "product.set_phone_limit", "product", p.id, {"from": antes, "to": despues})
+        s.commit()
+    typer.echo(
+        f"«{code}»: sin límite por número"
+        if clear
+        else f"«{code}»: máximo {max_} recarga(s) por número cada {days} día(s)"
+    )
 
 
 @product_app.command("set-ips")

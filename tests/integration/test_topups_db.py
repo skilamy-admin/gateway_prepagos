@@ -42,6 +42,15 @@ def test_external_ref_unica_por_producto(session: Session, reward: Reward) -> No
         _guardar(session, nueva_topup(reward, "ref-1"))
 
 
+def test_misma_external_ref_en_otro_entorno_es_otra_recarga(
+    session: Session, reward: Reward
+) -> None:
+    _guardar(session, nueva_topup(reward, "ref-1", env=Env.TEST))
+    _guardar(session, nueva_topup(reward, "ref-1", env=Env.LIVE))
+    with pytest.raises(IntegrityError):
+        _guardar(session, nueva_topup(reward, "ref-1", env=Env.LIVE))
+
+
 def test_misma_external_ref_en_otro_producto_es_valida(session: Session, reward: Reward) -> None:
     _guardar(session, nueva_topup(reward, "ref-1"))
     otro = Product(code="otro", name="Otro", country_code="JM")

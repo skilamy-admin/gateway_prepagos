@@ -77,7 +77,8 @@ def get_topup_by_ref(
     external_ref: Annotated[str, Query(min_length=1, max_length=200)], auth: Auth, session: Db
 ) -> TopupOut:
     return _out(
-        session, _visible(find_by_external_ref(session, auth.product.id, external_ref), auth)
+        session,
+        _visible(find_by_external_ref(session, auth.product.id, auth.env, external_ref), auth),
     )
 
 

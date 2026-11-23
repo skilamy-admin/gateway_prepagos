@@ -8,7 +8,6 @@ Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reci
 - **Códigos nuevos** (desvío, para avisar a Skilamy):
   - `invalid_request` (422): JSON mal formado, falta un campo, o llega un campo no permitido (por ejemplo `amount`: el producto nunca envía montos).
   - `unknown_operator` (422): el campo `operator` no coincide con ningún operador del catálogo del país. El mensaje lista los válidos.
-  - `external_ref_conflict` (409): la `external_ref` ya se usó con una llave del **otro entorno**. Ver la pregunta abierta más abajo.
   - `not_found` (404): la recarga no existe, es de otro producto o es del otro entorno.
 - **Orden de validación:** la idempotencia va primero, antes de validar recompensa y teléfono. El brief pone primero las validaciones, pero así un reintento devuelve la misma transacción aunque la recompensa se haya desactivado después.
 - **Creación idempotente:** `INSERT … ON CONFLICT (product_id, external_ref) DO NOTHING RETURNING id`. Si otra solicitud ganó la carrera, se devuelve esa con 200. Probado con 10 solicitudes simultáneas por HTTP: una fila, un 202 y nueve 200.
@@ -28,7 +27,26 @@ Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reci
     - la IP real la entrega Nginx. En el paso 8, Nginx debe **reemplazar** `X-Forwarded-For` con `$remote_addr` (no agregarle), y uvicorn solo confía en 127.0.0.1. Si no, un cliente podría falsear su IP.
   - Defensa adicional prevista para el paso 8: `limit_req` de Nginx por IP antes de llegar a la API.
 
-**Pregunta abierta para Skilamy:** la única es `(product_id, external_ref)`, como dicen el PRD y el CLAUDE.md, así que test y live comparten el espacio de `external_ref`. Si un producto prueba con `user_123:curso_7` en sandbox y después pide lo mismo en producción, hoy recibe 409 `external_ref_conflict` en lugar de pagar. Así no se paga dos veces ni se pierde la recompensa en silencio, pero obliga a los productos a usar referencias distintas en test. Alternativa: hacer la única `(product_id, env, external_ref)`. Requiere aprobación porque cambia una regla de idempotencia.
+**Idempotencia por entorno (aprobado por Skilamy el 2026-11-23; desvío del PRD y del CLAUDE.md original):**
+
+- La única pasa a ser `(product_id, env, external_ref)`. Una prueba en sandbox con `user_123:curso_7` ya no bloquea la recarga real de producción con la misma referencia.
+- Dentro de cada entorno, la idempotencia es igual que antes.
+- La migración crea la restricción nueva antes de quitar la vieja.
+- CLAUDE.md quedó actualizado.
+
+**Topes de presupuesto y límite por teléfono (RF7), adelantados a la fase 1 (aprobado por Skilamy el 2026-11-23):**
+
+- **Moneda de los topes:** la moneda local del país (CRC), sobre el monto de las recompensas.
+  - Se cambió la recomendación anterior (USD sobre `invoiceAmount`): el costo en USD solo se conoce después de ejecutar y depende del operador; el monto local se conoce exacto antes.
+  - El gasto en USD queda para los reportes.
+- **Qué cuenta:** las recargas del mismo producto y entorno en PENDING, SUBMITTED, UNKNOWN o SUCCESS. Una UNKNOWN pudo haber cobrado; las FAILED liberan el presupuesto. Test y live tienen consumos separados.
+- **Día y mes** según la zona horaria del país (nueva columna `countries.timezone`, p. ej. `America/Costa_Rica`). `country add` la deduce si el país tiene una sola zona; si no (Jamaica comparte +1), exige `--timezone`.
+- **Límite por teléfono:** `max_per_phone` recargas en los últimos `per_phone_window_days` días (ventana móvil), por producto y entorno.
+- **Atomicidad:** al crear se bloquea la fila del producto (`SELECT … FOR UPDATE`), se vuelve a buscar la `external_ref` (un reintento nunca recibe `budget_exceeded`), se evalúan los límites y se inserta.
+  - Probado: con tope de 3 recompensas y 10 solicitudes simultáneas se crean exactamente 3.
+  - Costo: las creaciones de un mismo producto se serializan, lo que es aceptable con el volumen esperado.
+- **Errores:** 429 `budget_exceeded` y 429 `phone_limit_reached`, como en el PRD.
+- **CLI:** `product set-caps`, `product set-phone-limit`; `product show` muestra topes y consumo del día y del mes.
 
 ## 2026-11-23 — Cliente de Prepaynation y catálogo (paso 5)
 
