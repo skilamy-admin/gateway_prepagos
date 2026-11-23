@@ -5,8 +5,8 @@ LMS LearnDash…) hacia la API Valuetopup v2 de Prepaynation.
 
 ## Especificación
 
-- PRD: _pendiente de enlazar_
-- Brief técnico fase 1: _pendiente de enlazar_
+- PRD: [`docs/Gateway_prepagos — PRD.docx`](docs/Gateway_prepagos%20—%20PRD.docx)
+- Brief técnico fase 1: [`docs/Gateway_prepagos — Brief técnico fase 1.docx`](docs/Gateway_prepagos%20—%20Brief%20técnico%20fase%201.docx)
 
 Reglas de trabajo y del dominio: ver [`CLAUDE.md`](CLAUDE.md).
 Desvíos y decisiones: ver [`docs/decisiones.md`](docs/decisiones.md).
