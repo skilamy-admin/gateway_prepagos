@@ -2,6 +2,15 @@
 
 Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reciente arriba.
 
+## 2026-11-23 — Seguridad y CLI de configuración (paso 4)
+
+- La configuración se lee de `/etc/gateway_prepagos/env` (pydantic-settings) además del entorno, para que la CLI funcione sin exportar variables. Las variables de entorno tienen prioridad; los tests usan su propia llave maestra.
+- Llaves de producto: `sk_test_` / `sk_live_` + 32 caracteres alfanuméricos de `secrets`. En base solo quedan el SHA-256 y los primeros 12 caracteres. La comparación usa `hmac.compare_digest`.
+- `credentials set --env sandbox|production` pide el password sin mostrarlo y con confirmación, y lo cifra con Fernet antes de tocar la base. Con `production` exige una confirmación adicional; en esta fase no se usa.
+- Paso a `live` con `product set-status` pide confirmación.
+- Toda acción de la CLI que cambia datos se registra en `audit_log` (actor `cli:<usuario>`), sin llaves ni passwords.
+- Pendiente para el paso 5: `reward add` todavía no valida el monto contra los rangos del catálogo de cada operador (RF3), porque el catálogo llega en ese paso. Hoy solo valida formato, monto positivo y moneda del país.
+
 ## 2026-11-23 — Modelo de datos (paso 3)
 
 Cambios y agregados respecto a la tabla «Modelo de datos inicial» del PRD:
