@@ -12,7 +12,7 @@ Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reci
 
 ## 2026-11-23 — Diferencias entre el servidor real y el brief (pendiente de confirmar con Skilamy)
 
-- Código en `/home/gateway/gateway_prepagos`; el brief dice `/opt/gateway_prepagos`.
+- Ubicación del código (no es desvío): `/home/gateway/gateway_prepagos` es la copia de desarrollo (pasos 2 a 7). En el paso 8 se despliega en `/opt/gateway_prepagos`, como dice el brief, clonando desde el repositorio: dueño root y solo lectura para el usuario `gateway`, para que el servicio no pueda modificar su propio código, no ejecute código a medio editar y las unidades systemd puedan usar `ProtectHome=yes`. Crear `/opt/gateway_prepagos` requiere sudo (lo hace quien administre el VPS).
 - Base de datos `gateway_prepagos` (ya creada, dueño `gateway`); el brief dice base `gateway`. La URL por defecto usa `gateway_prepagos`.
 - `/etc/gateway_prepagos/env` todavía no existe y crearlo requiere root.
 - Paso 1 del brief (Nginx, Let's Encrypt, ufw) requiere sudo; el usuario `gateway` no lo tiene. Queda en manos de quien administre el VPS.
