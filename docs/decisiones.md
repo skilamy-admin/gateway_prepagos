@@ -31,15 +31,28 @@ Reglas que garantiza la base, además de las únicas (product_id, external_ref) 
   - los estados finales exigen `finalized_at`, y lo que pasó por SUBMITTED exige `submitted_at`;
   - teléfono en E.164, montos positivos y prefijo de llave coherente con su entorno.
 
-Pregunta abierta para Skilamy (afecta la fase 2, no bloquea): ¿en qué moneda van los topes `daily_cap` y `monthly_cap`? RF7 dice «moneda local» y la tabla de decisiones dice USD sobre `invoiceAmount`. Las columnas no fijan moneda; se decide al implementar los topes.
+Pregunta abierta para Skilamy (afecta la fase 2, no bloquea): ¿en qué moneda van los topes `daily_cap` y `monthly_cap`? RF7 dice «moneda local» y la tabla de decisiones dice USD sobre `invoiceAmount`. Las columnas no fijan moneda; se decide al implementar los topes. Recomendación: USD sobre `invoice_amount`, porque es el dinero que sale del wallet.
 
-**Respondido el 2026-11-23** (tabla de productos que Prepaynation entregó a Skilamy):
+**Catálogo de Prepaynation (`docs/Product_Catalog.xlsx`, revisado el 2026-11-23).** Es el único catálogo disponible; falta confirmar si el del sandbox es el mismo.
 
-- Pregunta abierta del PRD: los SKUs RTR de Costa Rica son de **denominación fija**. Cada monto es un SKU propio, con su Product Id y su Sku Id.
-- Columnas de esa tabla: Product Id, Sku Id, Country, Operator, Denomination Name, Wallet currency (siempre USD), Face Value (en la moneda del wallet), Target Currency (CRC para Costa Rica), Type, Benefit Type, Exchange Rate, validity, Delivery Amount y Product Description.
-- Consecuencia: una recompensa de 1 000 CRC se resuelve buscando, entre los SKUs del operador, el que entrega exactamente 1 000 CRC. Si no existe, la recarga se rechaza antes de llamar a Prepaynation.
-- En el paso 5 se ajusta `pn_catalog` (Face Value en USD, monto entregado, moneda destino, tipo de cambio…) con una migración nueva, después de ver la respuesta real de `/catalog/skus` en el sandbox. Los nombres de columnas de la hoja pueden no coincidir con los campos JSON de la API.
-- Los topes siguen sin decidir; la recomendación está en la conversación con Skilamy.
+- 8 843 SKUs y wallet siempre en USD. Columnas: Product Id, Sku Id, Country, Operator, Denomination Name, Wallet currency, Face Value (Wallet currency), Target Currency, Type, Benefit Type, Exchange Rate, validity, Delivery Amount, Product Description.
+- **Corrección:** las recargas de saldo de Costa Rica (Type RTR, Benefit Type Talktime) **no son de monto fijo: son de rango**, un SKU por operador. El rango se define en USD, y el monto en CRC es USD × tipo de cambio:
+
+  | Operador | SKU | USD | CRC | Tipo de cambio |
+  |---|---|---|---|---|
+  | Kolbi | 3390 | 3–50 | 1 512–25 200 | 504,00 |
+  | Claro | 1886 | 7–35 | 3 474,73–17 373,65 | 496,39 |
+  | Liberty | 5752 | 5–80 | 2 690,25–43 044 | 538,05 |
+  | Movistar | 2374 | 4–85 | 2 104–44 710 | 526,00 |
+
+- Los SKUs de monto fijo de Costa Rica son paquetes de Claro (Bundle «Superpack» y Data «Internet Super pack», con vigencia de 7 a 30 días). No son recargas de saldo.
+- Consecuencias para el diseño:
+  - Una recompensa en CRC es válida para un operador si cae dentro de su rango en CRC. Hoy el mínimo común a los cuatro operadores es el de Claro: unos 3 475 CRC. Una recompensa de 1 000 CRC no sirve para ningún operador.
+  - El tipo de cambio cambia, y con él los límites en CRC. Hay que validar contra el catálogo vigente al crear la recompensa (RF3) y otra vez antes de cada recarga.
+  - El costo en USD de una misma recompensa depende del operador (cada uno tiene su tipo de cambio). Afecta los topes y los reportes.
+  - Movistar ya no opera en Costa Rica (lo absorbió Liberty), pero sigue en el catálogo. Hay que preguntar a Prepaynation si el SKU 2374 sigue activo.
+- Jamaica (pruebas en sandbox): Digicel tiene SKUs de rango (193, 2639, 14197) y Flow tiene SKUs de monto fijo (4056 a 4075, de 5 a 100 USD). Sirve para probar ambos tipos, si el sandbox usa el mismo catálogo.
+- En el paso 5 se ajusta `pn_catalog` con una migración, después de ver la respuesta real de `/catalog/skus` en el sandbox: rango en USD y en moneda local, tipo de cambio, tipo de beneficio y vigencia. Los nombres de las columnas de la hoja pueden no coincidir con los campos JSON de la API.
 
 Tests de integración: usan un esquema temporal `test_<aleatorio>` dentro de `gateway_prepagos`, que se crea y se borra en cada ejecución. No hace falta otra base ni superusuario.
 
