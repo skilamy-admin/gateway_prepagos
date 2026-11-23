@@ -33,6 +33,14 @@ Reglas que garantiza la base, además de las únicas (product_id, external_ref) 
 
 Pregunta abierta para Skilamy (afecta la fase 2, no bloquea): ¿en qué moneda van los topes `daily_cap` y `monthly_cap`? RF7 dice «moneda local» y la tabla de decisiones dice USD sobre `invoiceAmount`. Las columnas no fijan moneda; se decide al implementar los topes.
 
+**Respondido el 2026-11-23** (tabla de productos que Prepaynation entregó a Skilamy):
+
+- Pregunta abierta del PRD: los SKUs RTR de Costa Rica son de **denominación fija**. Cada monto es un SKU propio, con su Product Id y su Sku Id.
+- Columnas de esa tabla: Product Id, Sku Id, Country, Operator, Denomination Name, Wallet currency (siempre USD), Face Value (en la moneda del wallet), Target Currency (CRC para Costa Rica), Type, Benefit Type, Exchange Rate, validity, Delivery Amount y Product Description.
+- Consecuencia: una recompensa de 1 000 CRC se resuelve buscando, entre los SKUs del operador, el que entrega exactamente 1 000 CRC. Si no existe, la recarga se rechaza antes de llamar a Prepaynation.
+- En el paso 5 se ajusta `pn_catalog` (Face Value en USD, monto entregado, moneda destino, tipo de cambio…) con una migración nueva, después de ver la respuesta real de `/catalog/skus` en el sandbox. Los nombres de columnas de la hoja pueden no coincidir con los campos JSON de la API.
+- Los topes siguen sin decidir; la recomendación está en la conversación con Skilamy.
+
 Tests de integración: usan un esquema temporal `test_<aleatorio>` dentro de `gateway_prepagos`, que se crea y se borra en cada ejecución. No hace falta otra base ni superusuario.
 
 ## 2026-11-23 — Esqueleto del proyecto (paso 0)
