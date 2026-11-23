@@ -1,4 +1,4 @@
-"""CLI de administración: países, productos, llaves, recompensas y credenciales.
+"""CLI de administración: países, productos, llaves, recompensas, credenciales y catálogo.
 
 Toda acción que cambia datos queda en audit_log (sin secretos).
 """
@@ -22,17 +22,29 @@ from sqlalchemy.orm import Session
 
 from app import __version__, db
 from app.config import get_settings
+from app.domain.rewards import coverage, talktime_skus
 from app.models import (
     ApiKey,
     AuditLog,
     Country,
     Env,
+    PnCatalogSku,
     Product,
     ProductStatus,
     Reward,
     Setting,
 )
+from app.prepaynation.catalog_sync import sync_catalog
+from app.prepaynation.client import (
+    MissingCredentialsError,
+    PnError,
+    PrepaynationClient,
+    available_balance,
+    client_for_env,
+)
+from app.prepaynation.events import persist_calls
 from app.security import (
+    DecryptionError,
     MasterKeyError,
     encrypt_secret,
     generate_api_key,
@@ -46,11 +58,15 @@ product_app = typer.Typer(help="Productos de Skilamy que piden recargas", no_arg
 key_app = typer.Typer(help="Llaves de API de los productos", no_args_is_help=True)
 reward_app = typer.Typer(help="Recompensas de cada producto", no_args_is_help=True)
 credentials_app = typer.Typer(help="Credenciales de Prepaynation", no_args_is_help=True)
+catalog_app = typer.Typer(
+    help="Catálogo de SKUs de Prepaynation (caché local)", no_args_is_help=True
+)
 app.add_typer(country_app, name="country")
 app.add_typer(product_app, name="product")
 app.add_typer(key_app, name="key")
 app.add_typer(reward_app, name="reward")
 app.add_typer(credentials_app, name="credentials")
+app.add_typer(catalog_app, name="catalog")
 
 
 class PnEnv(StrEnum):
@@ -377,14 +393,56 @@ def reward_add(
     code: Annotated[str, typer.Option(help="Código en mayúsculas, p. ej. CURSO_FINALIZADO")],
     label: Annotated[str, typer.Option(help="Descripción legible")],
     amount: Annotated[str, typer.Option(help="Monto en la moneda local del país del producto")],
+    allow_partial: Annotated[
+        bool,
+        typer.Option(
+            "--allow-partial", help="Aceptar aunque algún operador no tenga un SKU para ese monto"
+        ),
+    ] = False,
 ) -> None:
-    """Agrega una recompensa. La moneda es la del país del producto."""
+    """Agrega una recompensa, validando el monto contra el catálogo de cada operador (RF3).
+
+    La moneda es la del país del producto. Se valida contra el catálogo del entorno del
+    producto: sandbox si está en test; producción si está en live o suspended.
+    """
     if not _CODIGO_RECOMPENSA.fullmatch(code):
         raise _fail("El código solo admite mayúsculas, dígitos y «_» (máx. 50)")
     monto = _monto(amount)
     with _session() as s:
         producto = _product(s, product)
         moneda = s.get_one(Country, producto.country_code).currency
+        env = Env.TEST if producto.status == ProductStatus.TEST else Env.LIVE
+        skus = talktime_skus(s, env, producto.country_code)
+        if not skus:
+            typer.secho(
+                f"Aviso: no hay catálogo de {ENV_TO_PN_ENV[env].value} para "
+                f"{producto.country_code}; el monto no se pudo validar "
+                f"(gateway catalog sync --env {ENV_TO_PN_ENV[env].value}).",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            cobertura = coverage(skus, monto, moneda)
+            for op in cobertura:
+                if op.covered:
+                    typer.echo(f"  ✓ {op.operator_name}: SKU {op.covering[0].sku_id}")
+                else:
+                    rangos = ", ".join(
+                        f"{k.min_delivered}-{k.max_delivered} {k.delivery_currency}"
+                        for k in op.skus
+                    )
+                    typer.secho(
+                        f"  ✗ {op.operator_name}: ningún SKU entrega {monto} {moneda} "
+                        f"(disponible: {rangos})",
+                        fg=typer.colors.RED,
+                    )
+            faltan = [op.operator_name for op in cobertura if not op.covered]
+            if len(faltan) == len(cobertura):
+                raise _fail(f"Ningún operador puede entregar {monto} {moneda}")
+            if faltan and not allow_partial:
+                raise _fail(
+                    "Sin SKU para: " + ", ".join(faltan) + ". Usa --allow-partial para aceptar "
+                    "que esos números reciban FAILED."
+                )
         recompensa = Reward(
             product_id=producto.id, code=code, label=label, amount=monto, currency=moneda
         )
@@ -400,11 +458,6 @@ def reward_add(
         )  # fmt: skip
         s.commit()
     typer.echo(f"Recompensa {code} agregada: {monto} {moneda}")
-    # TODO(paso 5): validar el monto contra el catálogo de SKUs de cada operador del país (RF3).
-    typer.secho(
-        "Aviso: el monto aún no se valida contra el catálogo de Prepaynation (llega en el paso 5).",
-        fg=typer.colors.YELLOW,
-    )
 
 
 @reward_app.command("list")
@@ -498,3 +551,104 @@ def credentials_show() -> None:
             ],
             ["ENTORNO", "USERID", "PASSWORD", "ACTUALIZADO"],
         )
+
+
+# --- Catálogo y saldo -------------------------------------------------------------------------
+
+
+@contextmanager
+def _client(env: PnEnv) -> Iterator[PrepaynationClient]:
+    entorno = PN_ENV_TO_ENV[env]
+    with _session() as s:
+        try:
+            cliente = client_for_env(
+                s, entorno, on_call=persist_calls(db.get_sessionmaker(), entorno)
+            )
+        except (MissingCredentialsError, MasterKeyError, DecryptionError) as e:
+            raise _fail(str(e)) from None
+    with cliente:
+        yield cliente
+
+
+@catalog_app.command("sync")
+def catalog_sync(env: Annotated[PnEnv, typer.Option(help="sandbox o production")]) -> None:
+    """Descarga productos RTR, SKUs y códigos de error, y reemplaza la caché del entorno."""
+    with _client(env) as cliente, _session() as s:
+        try:
+            r = sync_catalog(s, cliente)
+        except PnError as e:
+            raise _fail(f"No se sincronizó: {e}") from None
+        _audit(
+            s, "catalog.sync", "pn_catalog", env.value,
+            {"products": r.products, "skus": r.skus, "errors": r.errors},
+        )  # fmt: skip
+        s.commit()
+    typer.echo(
+        f"Catálogo de {env.value}: {r.products} productos RTR, {r.skus} SKUs, "
+        f"{r.errors} códigos de error"
+    )
+
+
+@catalog_app.command("show")
+def catalog_show(
+    country: Annotated[str, typer.Option(help="Código de país, p. ej. CR")],
+    env: Annotated[PnEnv, typer.Option(help="sandbox o production")] = PnEnv.SANDBOX,
+    all_: Annotated[
+        bool, typer.Option("--all", help="Incluir paquetes de datos y bundles, no solo saldo")
+    ] = False,
+) -> None:
+    """Muestra los SKUs en caché de un país (por defecto, solo recargas de saldo)."""
+    entorno = PN_ENV_TO_ENV[env]
+    with _session() as s:
+        if all_:
+            skus = list(
+                s.scalars(
+                    select(PnCatalogSku)
+                    .where(
+                        PnCatalogSku.env == entorno, PnCatalogSku.country_code == country.upper()
+                    )
+                    .order_by(PnCatalogSku.operator_name, PnCatalogSku.sku_id)
+                )
+            )
+        else:
+            skus = talktime_skus(s, entorno, country.upper())
+        _tabla(
+            [
+                [
+                    k.sku_id,
+                    k.operator_name or "—",
+                    k.benefit_type or "—",
+                    _rango(k.min_amount, k.max_amount, k.face_value_currency),
+                    _rango(k.min_delivered, k.max_delivered, k.delivery_currency),
+                    str(k.exchange_rate or "—"),
+                    k.validity or "",
+                ]
+                for k in skus
+            ],
+            ["SKU", "OPERADOR", "TIPO", "FACE VALUE", "ENTREGADO", "CAMBIO", "VIGENCIA"],
+        )
+        if skus:
+            typer.echo(f"\nActualizado: {_fecha(skus[0].refreshed_at)}")
+
+
+def _rango(mn: Decimal | None, mx: Decimal | None, moneda: str | None) -> str:
+    if mn is None or mx is None:
+        return "—"
+    valor = f"{mn.normalize():f}" if mn == mx else f"{mn.normalize():f}-{mx.normalize():f}"
+    return f"{valor} {moneda or ''}".strip()
+
+
+@app.command()
+def balance(env: Annotated[PnEnv, typer.Option(help="sandbox o production")]) -> None:
+    """Saldo disponible del wallet de Prepaynation."""
+    with _client(env) as cliente:
+        try:
+            r = cliente.balance()
+        except PnError as e:
+            raise _fail(f"Error consultando el saldo: {e}") from None
+    if not r.ok or r.payload is None:
+        raise _fail(
+            f"Prepaynation respondió HTTP {r.http_status}, código {r.response_code!r} "
+            f"({r.response_message or 'sin mensaje'})"
+        )
+    typer.echo(f"Saldo disponible ({env.value}): {available_balance(r.payload)}")

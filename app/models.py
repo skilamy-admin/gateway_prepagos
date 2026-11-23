@@ -270,7 +270,7 @@ class TopupEvent(Base):
 class PnCatalogSku(Base):
     """Un SKU del catálogo de Prepaynation, por entorno. Se reemplaza en cada sincronización.
 
-    Los identificadores de Prepaynation se guardan como texto para no depender de su tipo.
+    Los identificadores de Prepaynation (enteros en la API) se guardan como texto.
     """
 
     __tablename__ = "pn_catalog"
@@ -284,11 +284,23 @@ class PnCatalogSku(Base):
     operator_name: Mapped[str | None] = mapped_column(String(200))
     country_code: Mapped[str | None] = mapped_column(String(2))
     category_id: Mapped[int | None] = mapped_column(Integer)
+    sku_name: Mapped[str | None] = mapped_column(String(200))
+    benefit_type: Mapped[str | None] = mapped_column(String(30))  # Talktime, Data, Bundle
+    validity: Mapped[str | None] = mapped_column(String(10))  # p. ej. 30D
+    # Rango del SKU (en uno fijo, mínimo = máximo), en tres monedas, según /catalog/skus:
+    # face value (lo que se envía en `amount`), entregado al usuario y en moneda del wallet.
     face_value_currency: Mapped[str | None] = mapped_column(String(3))
-    # Denominación fija (lista de montos) o rango (min/max), en face_value_currency.
-    denominations: Mapped[list[Decimal] | None] = mapped_column(ARRAY(Money))
-    min_amount: Mapped[Decimal | None] = mapped_column(Money)
-    max_amount: Mapped[Decimal | None] = mapped_column(Money)
+    min_amount: Mapped[Decimal | None] = mapped_column(PnMoney)
+    max_amount: Mapped[Decimal | None] = mapped_column(PnMoney)
+    delivery_currency: Mapped[str | None] = mapped_column(String(3))
+    min_delivered: Mapped[Decimal | None] = mapped_column(PnMoney)
+    max_delivered: Mapped[Decimal | None] = mapped_column(PnMoney)
+    min_wallet: Mapped[Decimal | None] = mapped_column(PnMoney)
+    max_wallet: Mapped[Decimal | None] = mapped_column(PnMoney)
+    exchange_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
+    fee: Mapped[Decimal | None] = mapped_column(PnMoney)
+    allow_decimal: Mapped[bool | None] = mapped_column(Boolean)
+    delivery_amount_type: Mapped[str | None] = mapped_column(String(20))  # actual / estimated
     raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB)  # respuesta original
     refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

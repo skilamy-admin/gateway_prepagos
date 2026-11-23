@@ -2,6 +2,34 @@
 
 Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reciente arriba.
 
+## 2026-11-23 — Cliente de Prepaynation y catálogo (paso 5)
+
+**Fuente:** especificación OpenAPI oficial (`/redocusaurus/api-v2.yaml`, enlazada desde el portal de desarrolladores de Valuetopup) y guías del portal (Transaction Flow, Authentication, Test Simulation).
+
+- **Campo `correlationId`:** la guía «Transaction Flow» lo escribe `corelationId`, pero la especificación usa `correlationId` (1 a 50 caracteres). Se usa el de la especificación.
+- **Tipos:** `skuId`, `productId`, `operatorId` y `transactionId` son enteros en la API. En la base se guardan como texto, como se decidió en el paso 3.
+- **`mobile`:** se envía con código de país y sin «+» (p. ej. `18765550123`), según el ejemplo del sandbox.
+- **Montos:** las respuestas se leen como `Decimal`, nunca como `float`. Al enviar, se verifica que el monto se pueda representar como número JSON sin perder precisión.
+- **El cliente nunca reintenta.** Un timeout o error de red lanza `PnTransportError`, con un indicador de si la petición pudo llegar. La decisión (UNKNOWN y consultar `/transaction/status`) es del worker.
+- **Registro de llamadas:** cada llamada se guarda en `topup_events`, en su propia transacción, para que quede aunque la operación falle. Se guardan método, ruta, parámetros, cuerpo y respuesta, nunca cabeceras ni credenciales.
+- **`pn_catalog`** se ajusta con una segunda migración, según el modelo `SkuModel` de la API:
+  - el rango de cada SKU (`min`/`max`) en tres monedas: face value (`faceValueCurrency`), entregado (`deliveryCurrencyCode`) y wallet;
+  - además, `exchangeRate`, `benefitType`, `validity`, `allowDecimal`, `fee` y `deliveryAmountType`;
+  - se elimina `denominations`: un SKU fijo tiene mínimo = máximo.
+- **Sincronización:** descarga `getproducts?categoryId=2`, `skus` y `errors`, y reemplaza la caché del entorno en una sola transacción. Si algo falla o el catálogo llega vacío, la caché anterior queda intacta. Solo se guardan SKUs de productos RTR.
+- **`reward add` valida el monto (RF3)** contra el rango *entregado* de los SKUs de saldo (Talktime) de cada operador del país. Usa el catálogo del entorno del producto (test → sandbox; live/suspended → producción).
+  - Si ningún operador cubre el monto, se rechaza.
+  - Si falta alguno, se rechaza salvo con `--allow-partial`.
+  - Si no hay catálogo, avisa.
+- **Pendiente de verificar en sandbox** antes de implementar el worker (paso 7): la especificación dice que `transactionCurrencyCode` debe ser una moneda que aparezca como `FaceValueCurrency` en `/catalog/skus`. Si para Costa Rica el face value está en USD, quizás no se pueda enviar `CRC`. Se prueba con Jamaica (JMD) en el sandbox y, si hace falta, se pregunta a support@prepaynation.com.
+- **Escenarios de prueba del sandbox** (guía «Test Simulation»), según cómo termina el número:
+  - `666666`: timeout de 120 s;
+  - `555555`: timeout de 90 s;
+  - `510`: sin stock;
+  - empieza por `1876` y termina en `888`: denominación inválida;
+  - `500`: cuenta no activada.
+- **Bloqueo (2026-11-23):** el sandbox responde HTTP 401 a todas las llamadas con las credenciales cargadas (sin espacios ni caracteres extraños). Falta la prueba manual de `balance` y `catalog sync` que pide el brief. Se pidió a Skilamy verificar las credenciales.
+
 ## 2026-11-23 — Seguridad y CLI de configuración (paso 4)
 
 - La configuración se lee de `/etc/gateway_prepagos/env` (pydantic-settings) además del entorno, para que la CLI funcione sin exportar variables. Las variables de entorno tienen prioridad; los tests usan su propia llave maestra.

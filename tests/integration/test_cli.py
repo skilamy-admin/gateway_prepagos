@@ -152,3 +152,60 @@ def test_auditoria(producto: str, session: Session) -> None:
     acciones = [a.action for a in session.scalars(select(AuditLog).order_by(AuditLog.id))]
     assert acciones == ["country.add", "product.add"]
     assert all(a.actor.startswith("cli:") for a in session.scalars(select(AuditLog)))
+
+
+# --- Catálogo, saldo y validación de recompensas (paso 5) -------------------------------------
+
+
+@pytest.fixture
+def pn_simulado(monkeypatch: pytest.MonkeyPatch) -> None:
+    """La CLI habla con un Prepaynation simulado en lugar del sandbox."""
+    import httpx
+
+    import app.cli as cli
+    from app.prepaynation import client as pn
+    from tests.fakes.prepaynation import catalog_handler
+
+    original = pn.client_for_env
+
+    def falso(session: Session, env: Env, **kw: object) -> pn.PrepaynationClient:
+        kw["transport"] = httpx.MockTransport(catalog_handler())
+        return original(session, env, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "client_for_env", falso)
+    gw("credentials", "set", "--env", "sandbox", input="u\np\np\n")
+
+
+def test_catalog_sync_show_y_balance(pn_simulado: None, session: Session) -> None:
+    assert "5 SKUs" in gw("catalog", "sync", "--env", "sandbox")
+    show = gw("catalog", "show", "--country", "CR")
+    assert "Kolbi" in show and "1512-25200 CRC" in show and "3-50 USD" in show
+    # El simulado devuelve -1234.56: en cuentas prepagas eso son 1234.56 disponibles.
+    assert "disponible (sandbox): 1234.56" in gw("balance", "--env", "sandbox")
+
+
+def test_catalog_sync_sin_credenciales() -> None:
+    assert "Faltan credenciales" in gw("catalog", "sync", "--env", "production", ok=False)
+
+
+@pytest.fixture
+def producto_cr(pn_simulado: None) -> str:
+    gw("country", "add", "CR", "--name", "Costa Rica", "--dial-prefix", "+506", "--currency", "CRC")
+    gw("product", "add", "bot", "--name", "Bot", "--country", "CR")
+    gw("catalog", "sync", "--env", "sandbox")
+    return "bot"
+
+
+def _reward(producto: str, monto: str, *extra: str, ok: bool = True) -> str:
+    return gw("reward", "add", "--product", producto, "--code", "R" + monto.replace(".", "_"),
+              "--label", "x", "--amount", monto, *extra, ok=ok)  # fmt: skip
+
+
+def test_reward_valida_contra_catalogo(producto_cr: str, session: Session) -> None:
+    out = _reward(producto_cr, "5000")
+    assert "✓ Claro" in out and "✓ Kolbi" in out
+    assert "Ningún operador" in _reward(producto_cr, "1000", ok=False)
+    parcial = _reward(producto_cr, "2000", ok=False)
+    assert "Sin SKU para: Claro" in parcial
+    _reward(producto_cr, "2000", "--allow-partial")
+    assert sorted(r.code for r in session.scalars(select(Reward))) == ["R2000", "R5000"]
