@@ -1,12 +1,137 @@
-"""CLI de administración: productos, llaves, recompensas, credenciales, transacciones."""
+"""CLI de administración: países, productos, llaves, recompensas y credenciales.
 
+Toda acción que cambia datos queda en audit_log (sin secretos).
+"""
+
+import getpass
+import os
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+from enum import StrEnum
+from typing import Annotated, Any
+
+import phonenumbers
 import typer
 import uvicorn
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from app import __version__
+from app import __version__, db
 from app.config import get_settings
+from app.models import (
+    ApiKey,
+    AuditLog,
+    Country,
+    Env,
+    Product,
+    ProductStatus,
+    Reward,
+    Setting,
+)
+from app.security import (
+    MasterKeyError,
+    encrypt_secret,
+    generate_api_key,
+    hash_api_key,
+    key_prefix,
+)
 
 app = typer.Typer(help="Administración de Gateway_prepagos", no_args_is_help=True)
+country_app = typer.Typer(help="Países", no_args_is_help=True)
+product_app = typer.Typer(help="Productos de Skilamy que piden recargas", no_args_is_help=True)
+key_app = typer.Typer(help="Llaves de API de los productos", no_args_is_help=True)
+reward_app = typer.Typer(help="Recompensas de cada producto", no_args_is_help=True)
+credentials_app = typer.Typer(help="Credenciales de Prepaynation", no_args_is_help=True)
+app.add_typer(country_app, name="country")
+app.add_typer(product_app, name="product")
+app.add_typer(key_app, name="key")
+app.add_typer(reward_app, name="reward")
+app.add_typer(credentials_app, name="credentials")
+
+
+class PnEnv(StrEnum):
+    """Nombre del entorno de Prepaynation en la CLI."""
+
+    SANDBOX = "sandbox"
+    PRODUCTION = "production"
+
+
+PN_ENV_TO_ENV = {PnEnv.SANDBOX: Env.TEST, PnEnv.PRODUCTION: Env.LIVE}
+ENV_TO_PN_ENV = {v: k for k, v in PN_ENV_TO_ENV.items()}
+
+_CODIGO_RECOMPENSA = re.compile(r"^[A-Z0-9_]{1,50}$")
+_CODIGO_PRODUCTO = re.compile(r"^[a-z0-9_-]{1,50}$")
+
+
+# --- Utilidades -------------------------------------------------------------------------------
+
+
+def _actor() -> str:
+    return "cli:" + (os.environ.get("SUDO_USER") or getpass.getuser())
+
+
+def _fail(mensaje: str) -> typer.Exit:
+    typer.secho(mensaje, fg=typer.colors.RED, err=True)
+    return typer.Exit(code=1)
+
+
+@contextmanager
+def _session() -> Iterator[Session]:
+    with db.get_sessionmaker()() as s:
+        yield s
+
+
+def _audit(
+    s: Session,
+    action: str,
+    target_type: str | None = None,
+    target_id: object = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    s.add(
+        AuditLog(
+            actor=_actor(),
+            action=action,
+            target_type=target_type,
+            target_id=None if target_id is None else str(target_id),
+            details=details,
+        )
+    )
+
+
+def _commit(s: Session, duplicado: str) -> None:
+    try:
+        s.commit()
+    except IntegrityError:
+        s.rollback()
+        raise _fail(duplicado) from None
+
+
+def _product(s: Session, code: str) -> Product:
+    producto = s.scalar(select(Product).where(Product.code == code))
+    if producto is None:
+        raise _fail(f"No existe el producto «{code}»")
+    return producto
+
+
+def _fecha(valor: datetime | None) -> str:
+    return valor.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC") if valor else "—"
+
+
+def _tabla(filas: list[list[str]], encabezado: list[str]) -> None:
+    if not filas:
+        typer.echo("(vacío)")
+        return
+    anchos = [max(len(str(x)) for x in col) for col in zip(encabezado, *filas, strict=False)]
+    for fila in [encabezado, *filas]:
+        typer.echo("  ".join(str(v).ljust(a) for v, a in zip(fila, anchos, strict=True)))
+
+
+# --- General ----------------------------------------------------------------------------------
 
 
 @app.command()
@@ -35,3 +160,341 @@ def worker() -> None:
     from app.worker.main import run
 
     run()
+
+
+# --- Países -----------------------------------------------------------------------------------
+
+
+@country_app.command("add")
+def country_add(
+    code: Annotated[str, typer.Argument(help="ISO 3166 alfa-2, p. ej. CR")],
+    name: Annotated[str, typer.Option(help="Nombre, p. ej. «Costa Rica»")],
+    dial_prefix: Annotated[str, typer.Option(help="Prefijo internacional, p. ej. +506 o +1876")],
+    currency: Annotated[str, typer.Option(help="Moneda local ISO 4217, p. ej. CRC")],
+) -> None:
+    """Agrega un país."""
+    code, currency = code.upper(), currency.upper()
+    cc = phonenumbers.country_code_for_region(code)
+    if cc == 0:
+        raise _fail(f"«{code}» no es un código de país válido")
+    if not re.fullmatch(r"\+[0-9]{1,6}", dial_prefix) or not dial_prefix.startswith(f"+{cc}"):
+        raise _fail(f"El prefijo de {code} debe empezar por +{cc} (recibido «{dial_prefix}»)")
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise _fail("La moneda debe tener 3 letras (ISO 4217)")
+    with _session() as s:
+        s.add(Country(code=code, name=name, dial_prefix=dial_prefix, currency=currency))
+        _audit(
+            s, "country.add", "country", code, {"dial_prefix": dial_prefix, "currency": currency}
+        )
+        _commit(s, f"El país {code} ya existe")
+    typer.echo(f"País {code} agregado")
+
+
+@country_app.command("list")
+def country_list() -> None:
+    """Lista los países."""
+    with _session() as s:
+        paises = s.scalars(select(Country).order_by(Country.code)).all()
+        _tabla(
+            [
+                [p.code, p.name, p.dial_prefix, p.currency, "sí" if p.active else "no"]
+                for p in paises
+            ],
+            ["CÓDIGO", "NOMBRE", "PREFIJO", "MONEDA", "ACTIVO"],
+        )
+
+
+# --- Productos --------------------------------------------------------------------------------
+
+
+@product_app.command("add")
+def product_add(
+    code: Annotated[str, typer.Argument(help="Código corto en minúsculas, p. ej. whatsapp_bot")],
+    name: Annotated[str, typer.Option(help="Nombre legible")],
+    country: Annotated[str, typer.Option(help="Código del país (uno por producto)")],
+) -> None:
+    """Agrega un producto. Empieza en estado test (solo sandbox)."""
+    if not _CODIGO_PRODUCTO.fullmatch(code):
+        raise _fail("El código solo admite minúsculas, dígitos, «_» y «-» (máx. 50)")
+    with _session() as s:
+        pais = s.get(Country, country.upper())
+        if pais is None or not pais.active:
+            raise _fail(f"El país «{country}» no existe o no está activo")
+        producto = Product(code=code, name=name, country_code=pais.code)
+        s.add(producto)
+        try:
+            s.flush()
+        except IntegrityError:
+            s.rollback()
+            raise _fail(f"El producto «{code}» ya existe") from None
+        _audit(s, "product.add", "product", producto.id, {"code": code, "country": pais.code})
+        s.commit()
+    typer.echo(f"Producto «{code}» agregado en estado test")
+
+
+@product_app.command("list")
+def product_list() -> None:
+    """Lista los productos."""
+    with _session() as s:
+        llaves_activas = (
+            select(ApiKey.product_id, func.count().label("n"))
+            .where(ApiKey.revoked_at.is_(None))
+            .group_by(ApiKey.product_id)
+            .subquery()
+        )
+        filas = s.execute(
+            select(Product, func.coalesce(llaves_activas.c.n, 0))
+            .outerjoin(llaves_activas, llaves_activas.c.product_id == Product.id)
+            .order_by(Product.code)
+        ).all()
+        _tabla(
+            [[p.code, p.name, p.country_code, p.status.value, str(n)] for p, n in filas],
+            ["CÓDIGO", "NOMBRE", "PAÍS", "ESTADO", "LLAVES ACTIVAS"],
+        )
+
+
+@product_app.command("set-status")
+def product_set_status(
+    code: Annotated[str, typer.Argument()],
+    status: Annotated[ProductStatus, typer.Argument(help="test, live o suspended")],
+    yes: Annotated[bool, typer.Option("--yes", help="No pedir confirmación")] = False,
+) -> None:
+    """Cambia el estado: test (sandbox), live (producción) o suspended (kill switch)."""
+    with _session() as s:
+        producto = _product(s, code)
+        anterior = producto.status
+        if anterior == status:
+            typer.echo(f"«{code}» ya está en {status.value}")
+            return
+        if status == ProductStatus.LIVE and not yes:
+            typer.confirm(
+                f"«{code}» pasará a live: sus llaves sk_live_ ejecutarán recargas con dinero "
+                "real en producción. ¿Continuar?",
+                abort=True,
+            )
+        producto.status = status
+        _audit(
+            s, "product.set_status", "product", producto.id,
+            {"from": anterior.value, "to": status.value},
+        )  # fmt: skip
+        s.commit()
+    typer.echo(f"«{code}»: {anterior.value} → {status.value}")
+
+
+# --- Llaves -----------------------------------------------------------------------------------
+
+
+@key_app.command("create")
+def key_create(
+    product: Annotated[str, typer.Option(help="Código del producto")],
+    env: Annotated[Env, typer.Option(help="test (sandbox) o live (producción)")],
+) -> None:
+    """Crea una llave. Se muestra una sola vez: guárdala en el servidor del producto."""
+    llave = generate_api_key(env)
+    with _session() as s:
+        producto = _product(s, product)
+        registro = ApiKey(
+            product_id=producto.id, env=env, prefix=key_prefix(llave), key_hash=hash_api_key(llave)
+        )
+        s.add(registro)
+        s.flush()
+        _audit(s, "key.create", "api_key", registro.id, {"product": product, "env": env.value})
+        s.commit()
+        estado = producto.status
+    typer.echo(f"Llave {registro.id} creada para «{product}» ({env.value}):\n")
+    typer.secho(f"    {llave}\n", bold=True)
+    typer.echo("Es la única vez que se muestra. El gateway solo guarda su hash.")
+    if env == Env.LIVE and estado != ProductStatus.LIVE:
+        typer.secho(
+            f"Aviso: «{product}» está en {estado.value}; esta llave recibirá 403 "
+            "product_suspended hasta que el producto pase a live.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+@key_app.command("list")
+def key_list(product: Annotated[str, typer.Option(help="Código del producto")]) -> None:
+    """Lista las llaves de un producto (solo prefijo visible)."""
+    with _session() as s:
+        producto = _product(s, product)
+        llaves = s.scalars(
+            select(ApiKey).where(ApiKey.product_id == producto.id).order_by(ApiKey.id)
+        ).all()
+        _tabla(
+            [
+                [
+                    str(k.id),
+                    k.env.value,
+                    k.prefix + "…",
+                    _fecha(k.created_at),
+                    _fecha(k.last_used_at),
+                    "REVOCADA " + _fecha(k.revoked_at) if k.revoked_at else "activa",
+                ]
+                for k in llaves
+            ],
+            ["ID", "ENTORNO", "PREFIJO", "CREADA", "ÚLTIMO USO", "ESTADO"],
+        )
+
+
+@key_app.command("revoke")
+def key_revoke(
+    key_id: Annotated[int, typer.Argument(help="ID de la llave (ver «key list»)")],
+    yes: Annotated[bool, typer.Option("--yes", help="No pedir confirmación")] = False,
+) -> None:
+    """Revoca una llave. No se puede deshacer."""
+    with _session() as s:
+        llave = s.get(ApiKey, key_id)
+        if llave is None:
+            raise _fail(f"No existe la llave {key_id}")
+        if llave.revoked_at is not None:
+            typer.echo(f"La llave {key_id} ya estaba revocada")
+            return
+        if not yes:
+            typer.confirm(f"¿Revocar la llave {key_id} ({llave.prefix}…)?", abort=True)
+        llave.revoked_at = datetime.now(UTC)
+        _audit(s, "key.revoke", "api_key", key_id, {"prefix": llave.prefix})
+        s.commit()
+    typer.echo(f"Llave {key_id} revocada")
+
+
+# --- Recompensas ------------------------------------------------------------------------------
+
+
+def _monto(valor: str) -> Decimal:
+    try:
+        monto = Decimal(valor)
+    except InvalidOperation:
+        raise _fail(f"Monto inválido: «{valor}»") from None
+    exponente = monto.as_tuple().exponent
+    if not monto.is_finite() or monto <= 0 or not isinstance(exponente, int) or exponente < -2:
+        raise _fail("El monto debe ser positivo y con 2 decimales como máximo")
+    return monto
+
+
+@reward_app.command("add")
+def reward_add(
+    product: Annotated[str, typer.Option(help="Código del producto")],
+    code: Annotated[str, typer.Option(help="Código en mayúsculas, p. ej. CURSO_FINALIZADO")],
+    label: Annotated[str, typer.Option(help="Descripción legible")],
+    amount: Annotated[str, typer.Option(help="Monto en la moneda local del país del producto")],
+) -> None:
+    """Agrega una recompensa. La moneda es la del país del producto."""
+    if not _CODIGO_RECOMPENSA.fullmatch(code):
+        raise _fail("El código solo admite mayúsculas, dígitos y «_» (máx. 50)")
+    monto = _monto(amount)
+    with _session() as s:
+        producto = _product(s, product)
+        moneda = s.get_one(Country, producto.country_code).currency
+        recompensa = Reward(
+            product_id=producto.id, code=code, label=label, amount=monto, currency=moneda
+        )
+        s.add(recompensa)
+        try:
+            s.flush()
+        except IntegrityError:
+            s.rollback()
+            raise _fail(f"«{product}» ya tiene la recompensa {code}") from None
+        _audit(
+            s, "reward.add", "reward", recompensa.id,
+            {"product": product, "code": code, "amount": str(monto), "currency": moneda},
+        )  # fmt: skip
+        s.commit()
+    typer.echo(f"Recompensa {code} agregada: {monto} {moneda}")
+    # TODO(paso 5): validar el monto contra el catálogo de SKUs de cada operador del país (RF3).
+    typer.secho(
+        "Aviso: el monto aún no se valida contra el catálogo de Prepaynation (llega en el paso 5).",
+        fg=typer.colors.YELLOW,
+    )
+
+
+@reward_app.command("list")
+def reward_list(
+    product: Annotated[str, typer.Option(help="Código del producto")],
+    all_: Annotated[bool, typer.Option("--all", help="Incluir desactivadas")] = False,
+) -> None:
+    """Lista las recompensas de un producto."""
+    with _session() as s:
+        producto = _product(s, product)
+        consulta = select(Reward).where(Reward.product_id == producto.id).order_by(Reward.code)
+        if not all_:
+            consulta = consulta.where(Reward.active)
+        _tabla(
+            [
+                [r.code, r.label, f"{r.amount} {r.currency}", "sí" if r.active else "no"]
+                for r in s.scalars(consulta)
+            ],
+            ["CÓDIGO", "DESCRIPCIÓN", "MONTO", "ACTIVA"],
+        )
+
+
+@reward_app.command("disable")
+def reward_disable(
+    product: Annotated[str, typer.Option(help="Código del producto")],
+    code: Annotated[str, typer.Option(help="Código de la recompensa")],
+) -> None:
+    """Desactiva una recompensa: las solicitudes nuevas reciben 422 unknown_reward."""
+    with _session() as s:
+        producto = _product(s, product)
+        recompensa = s.scalar(
+            select(Reward).where(Reward.product_id == producto.id, Reward.code == code)
+        )
+        if recompensa is None:
+            raise _fail(f"«{product}» no tiene la recompensa {code}")
+        if not recompensa.active:
+            typer.echo(f"{code} ya estaba desactivada")
+            return
+        recompensa.active = False
+        _audit(s, "reward.disable", "reward", recompensa.id, {"product": product, "code": code})
+        s.commit()
+    typer.echo(f"Recompensa {code} desactivada")
+
+
+# --- Credenciales de Prepaynation -------------------------------------------------------------
+
+
+@credentials_app.command("set")
+def credentials_set(
+    env: Annotated[PnEnv, typer.Option(help="sandbox o production")],
+    user_id: Annotated[str, typer.Option(prompt="userId de Prepaynation")],
+) -> None:
+    """Guarda las credenciales de Prepaynation. El password se pide sin mostrarlo y se cifra."""
+    if env == PnEnv.PRODUCTION:
+        typer.confirm(
+            "Vas a cargar credenciales de PRODUCCIÓN (dinero real). ¿Continuar?", abort=True
+        )
+    password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+    if not password:
+        raise _fail("El password no puede estar vacío")
+    try:
+        cifrado = encrypt_secret(password)
+    except MasterKeyError as e:
+        raise _fail(str(e)) from None
+    del password
+    entorno = PN_ENV_TO_ENV[env]
+    with _session() as s:
+        fila = s.get(Setting, entorno) or Setting(env=entorno)
+        fila.pn_user_id = user_id
+        fila.pn_password_enc = cifrado
+        s.add(fila)
+        _audit(s, "credentials.set", "settings", env.value)
+        s.commit()
+    typer.echo(f"Credenciales de {env.value} guardadas (password cifrado)")
+
+
+@credentials_app.command("show")
+def credentials_show() -> None:
+    """Muestra qué credenciales están cargadas (nunca el password)."""
+    with _session() as s:
+        filas = {f.env: f for f in s.scalars(select(Setting))}
+        _tabla(
+            [
+                [
+                    pn_env.value,
+                    (f.pn_user_id or "—") if f else "—",
+                    "cargado" if f and f.pn_password_enc else "falta",
+                    _fecha(f.updated_at) if f else "—",
+                ]
+                for pn_env, f in ((p, filas.get(e)) for p, e in PN_ENV_TO_ENV.items())
+            ],
+            ["ENTORNO", "USERID", "PASSWORD", "ACTUALIZADO"],
+        )
