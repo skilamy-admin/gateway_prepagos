@@ -18,9 +18,8 @@ Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reci
 - Paso 1 del brief, verificado el 2026-11-23 sin sudo:
   - Nginx activo y habilitado al arrancar; `recargas.skilamy.com` resuelve en DNS público a la IP del VPS (95.179.222.249).
   - Certificado de Let's Encrypt válido hasta 2027-02-21, renovación automática con `certbot.timer`, TLS 1.2 y 1.3. El puerto 80 solo redirige a HTTPS.
-  - ufw activo y habilitado, pero sus reglas no se pueden leer sin root. Puertos que escuchan hacia fuera: 22, 80 y 443; PostgreSQL solo en localhost.
-  - Pendiente con sudo: confirmar las reglas con `sudo ufw status verbose`.
-  - El brief pide solo 22 y 443, pero se propone dejar abierto el 80: certbot lo necesita para renovar con el desafío HTTP-01 y solo redirige a HTTPS.
+  - ufw (`sudo ufw status verbose`, 2026-11-23): entrada denegada por defecto; 22/tcp en LIMIT (frena fuerza bruta) y 80/tcp y 443/tcp permitidos, en IPv4 e IPv6. PostgreSQL escucha solo en localhost.
+  - Desvío: el brief pide solo 22 y 443; el 80 queda abierto porque certbot lo usa para renovar con el desafío HTTP-01, y Nginx solo redirige a HTTPS desde ahí.
   - El sitio de Nginx todavía sirve `/var/www/html`; en el paso 8 se cambia por el proxy hacia la API (`deploy/nginx-recargas.conf`).
 
 ## 2026-11-23 — Versiones de la plataforma
