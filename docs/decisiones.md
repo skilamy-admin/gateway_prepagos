@@ -2,6 +2,60 @@
 
 Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reciente arriba.
 
+## 2026-11-23 — Modelo de datos (paso 3)
+
+Cambios y agregados respecto a la tabla «Modelo de datos inicial» del PRD:
+
+- **Tabla nueva `pn_error_codes`** (env, code, message): el brief pide sincronizar `/catalog/errors`, que no cabe en `pn_catalog`. Son 11 tablas en lugar de 10.
+- **`topups.next_check_at`** (nuevo): próxima consulta a `/transaction/status`, para la espera creciente de la reconciliación (30 s, 1 min, 2 min, 5 min, cada 15 min). `attempts` cuenta esas consultas.
+- **`topup_events`**: `topup_id` admite NULL para registrar también las llamadas que no son de una recarga (balance, catálogo), como pide el brief («cada llamada se registra en topup_events»). Se agregan `env` y `http_status`.
+- **`products.webhook_secret` → `webhook_secret_enc`**: el secreto HMAC se guarda cifrado con Fernet, igual que las credenciales.
+- **`pn_catalog.product_id` → `pn_product_id`**, para no confundirlo con nuestros productos. Se agregan `product_name`, `operator_name` y `raw` (respuesta original, por si el formato del catálogo trae algo que no se modeló).
+- **Un solo vocabulario de entorno: `test` / `live`** en llaves, recargas, catálogo y settings (test = sandbox, live = producción). La CLI acepta `--env sandbox|production` y lo traduce.
+- **`settings`** es una fila por entorno: `pn_user_id`, `pn_password_enc` (Fernet), `wallet_currency`, `low_balance_threshold` (valor absoluto).
+- **`operator_source`** con valores `lookup` / `user` (el PRD dice «lookup/usuario»).
+- **Identificadores de Prepaynation** (`sku_id`, `operator_id`, `transactionId`…) como texto, para no depender de su tipo.
+- **`external_ref`** de hasta 200 caracteres; el PRD no fija un largo.
+- **ID de recarga** `tp_` + ULID (29 caracteres) y `correlation_id` = ULID (26 caracteres). El ULID se implementa en `app/ids.py` para no sumar una dependencia.
+- **Enumeraciones** como VARCHAR + CHECK, no ENUM nativo de PostgreSQL, porque son más fáciles de migrar.
+
+Reglas que garantiza la base, además de las únicas (product_id, external_ref) y correlation_id:
+
+- **Trigger `topups_guard`**:
+  - toda recarga nueva entra en PENDING;
+  - solo se permiten PENDING → SUBMITTED | FAILED, SUBMITTED → SUCCESS | FAILED | UNKNOWN y UNKNOWN → SUCCESS | FAILED (PENDING → FAILED es el rechazo antes del envío);
+  - una fila en estado final no se modifica;
+  - identidad, monto, moneda, teléfono, external_ref y correlation_id no cambian nunca, y SKU, operador y submitted_at no cambian después del envío.
+- **CHECK**:
+  - SUCCESS exige `pn_response_code = '000'`;
+  - los estados finales exigen `finalized_at`, y lo que pasó por SUBMITTED exige `submitted_at`;
+  - teléfono en E.164, montos positivos y prefijo de llave coherente con su entorno.
+
+Pregunta abierta para Skilamy (afecta la fase 2, no bloquea): ¿en qué moneda van los topes `daily_cap` y `monthly_cap`? RF7 dice «moneda local» y la tabla de decisiones dice USD sobre `invoiceAmount`. Las columnas no fijan moneda; se decide al implementar los topes. Recomendación: USD sobre `invoice_amount`, porque es el dinero que sale del wallet.
+
+**Catálogo de Prepaynation (`docs/Product_Catalog.xlsx`, revisado el 2026-11-23).** Es el único catálogo disponible; falta confirmar si el del sandbox es el mismo.
+
+- 8 843 SKUs y wallet siempre en USD. Columnas: Product Id, Sku Id, Country, Operator, Denomination Name, Wallet currency, Face Value (Wallet currency), Target Currency, Type, Benefit Type, Exchange Rate, validity, Delivery Amount, Product Description.
+- **Corrección:** las recargas de saldo de Costa Rica (Type RTR, Benefit Type Talktime) **no son de monto fijo: son de rango**, un SKU por operador. El rango se define en USD, y el monto en CRC es USD × tipo de cambio:
+
+  | Operador | SKU | USD | CRC | Tipo de cambio |
+  |---|---|---|---|---|
+  | Kolbi | 3390 | 3–50 | 1 512–25 200 | 504,00 |
+  | Claro | 1886 | 7–35 | 3 474,73–17 373,65 | 496,39 |
+  | Liberty | 5752 | 5–80 | 2 690,25–43 044 | 538,05 |
+  | Movistar | 2374 | 4–85 | 2 104–44 710 | 526,00 |
+
+- Los SKUs de monto fijo de Costa Rica son paquetes de Claro (Bundle «Superpack» y Data «Internet Super pack», con vigencia de 7 a 30 días). No son recargas de saldo.
+- Consecuencias para el diseño:
+  - Una recompensa en CRC es válida para un operador si cae dentro de su rango en CRC. Hoy el mínimo común a los cuatro operadores es el de Claro: unos 3 475 CRC. Una recompensa de 1 000 CRC no sirve para ningún operador.
+  - El tipo de cambio cambia, y con él los límites en CRC. Hay que validar contra el catálogo vigente al crear la recompensa (RF3) y otra vez antes de cada recarga.
+  - El costo en USD de una misma recompensa depende del operador (cada uno tiene su tipo de cambio). Afecta los topes y los reportes.
+  - Movistar ya no opera en Costa Rica (lo absorbió Liberty), pero sigue en el catálogo. Hay que preguntar a Prepaynation si el SKU 2374 sigue activo.
+- Jamaica (pruebas en sandbox): Digicel tiene SKUs de rango (193, 2639, 14197) y Flow tiene SKUs de monto fijo (4056 a 4075, de 5 a 100 USD). Sirve para probar ambos tipos, si el sandbox usa el mismo catálogo.
+- En el paso 5 se ajusta `pn_catalog` con una migración, después de ver la respuesta real de `/catalog/skus` en el sandbox: rango en USD y en moneda local, tipo de cambio, tipo de beneficio y vigencia. Los nombres de las columnas de la hoja pueden no coincidir con los campos JSON de la API.
+
+Tests de integración: usan un esquema temporal `test_<aleatorio>` dentro de `gateway_prepagos`, que se crea y se borra en cada ejecución. No hace falta otra base ni superusuario.
+
 ## 2026-11-23 — Esqueleto del proyecto (paso 0)
 
 - Configuración con `pydantic-settings` (variables `GATEWAY_*`), dependencia oficial de Pydantic v2; no está en el stack listado pero no agrega servicios.
