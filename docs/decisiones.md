@@ -14,7 +14,7 @@ Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reci
 
 - Ubicación del código (no es desvío): `/home/gateway/gateway_prepagos` es la copia de desarrollo (pasos 2 a 7). En el paso 8 se despliega en `/opt/gateway_prepagos`, como dice el brief, clonando desde el repositorio: dueño root y solo lectura para el usuario `gateway`, para que el servicio no pueda modificar su propio código, no ejecute código a medio editar y las unidades systemd puedan usar `ProtectHome=yes`. Crear `/opt/gateway_prepagos` requiere sudo (lo hace quien administre el VPS).
 - Base de datos: se usa la existente, `gateway_prepagos` (dueño `gateway`, sin contraseña, por socket local); el brief dice base `gateway`, que no existe en el servidor. Confirmado con Skilamy el 2026-11-23.
-- `/etc/gateway_prepagos/env` todavía no existe y crearlo requiere root.
+- Desvío: `/etc/gateway_prepagos/env` con dueño `root:gateway` y permisos `0640` (carpeta `0750`) en lugar de dueño `gateway` y `0600`, para que el servicio pueda leer su configuración pero no modificarla. Aprobado por Skilamy el 2026-11-23. La crea quien tenga sudo; la llave maestra se genera en el servidor y va directo al archivo.
 - Paso 1 del brief, verificado el 2026-11-23 sin sudo:
   - Nginx activo y habilitado al arrancar; `recargas.skilamy.com` resuelve en DNS público a la IP del VPS (95.179.222.249).
   - Certificado de Let's Encrypt válido hasta 2027-02-21, renovación automática con `certbot.timer`, TLS 1.2 y 1.3. El puerto 80 solo redirige a HTTPS.
