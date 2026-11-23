@@ -2,6 +2,26 @@
 
 Desvíos del PRD y decisiones técnicas importantes, con su motivo. La más reciente arriba.
 
+## 2026-11-23 — API v1 (paso 6)
+
+- **Formato de error:** `{"error": "<código>", "message": "<texto>"}`. Los códigos son los del PRD; nunca se incluyen trazas ni detalles internos.
+- **Códigos nuevos** (desvío, para avisar a Skilamy):
+  - `invalid_request` (422): JSON mal formado, falta un campo, o llega un campo no permitido (por ejemplo `amount`: el producto nunca envía montos).
+  - `unknown_operator` (422): el campo `operator` no coincide con ningún operador del catálogo del país. El mensaje lista los válidos.
+  - `external_ref_conflict` (409): la `external_ref` ya se usó con una llave del **otro entorno**. Ver la pregunta abierta más abajo.
+  - `not_found` (404): la recarga no existe, es de otro producto o es del otro entorno.
+- **Orden de validación:** la idempotencia va primero, antes de validar recompensa y teléfono. El brief pone primero las validaciones, pero así un reintento devuelve la misma transacción aunque la recompensa se haya desactivado después.
+- **Creación idempotente:** `INSERT … ON CONFLICT (product_id, external_ref) DO NOTHING RETURNING id`. Si otra solicitud ganó la carrera, se devuelve esa con 200. Probado con 10 solicitudes simultáneas por HTTP: una fila, un 202 y nueve 200.
+- **Teléfono:** se acepta en formato internacional o nacional del país. Debe ser válido para la región, empezar por el `dial_prefix` del país (+1876 excluye el 658 de Jamaica) y ser móvil según phonenumbers.
+- **`operator`:** es el *nombre* del operador (Kolbi, Claro, Liberty, como dicen las notas del PRD). Se resuelve al `operatorId` de Prepaynation con el catálogo del entorno de la llave, sin distinguir mayúsculas. Se guarda con `operator_source = user`.
+- **Visibilidad:** un producto solo ve sus recargas y solo las del entorno de su llave (separación estricta test/live).
+- **Respuesta de consulta:**
+  - campos: `id`, `external_ref`, `status`, `env`, `reward_code`, `amount` (número JSON), `currency`, `phone`, `error_code`, `created_at` y `finalized_at`;
+  - `error_code` es el código de Prepaynation y solo aparece si la recarga terminó en FAILED.
+- **No incluido en esta fase** (PRD, no está en el brief de fase 1): rate limiting por llave y lista de IPs permitidas por producto (la columna `allowed_ips` ya existe).
+
+**Pregunta abierta para Skilamy:** la única es `(product_id, external_ref)`, como dicen el PRD y el CLAUDE.md, así que test y live comparten el espacio de `external_ref`. Si un producto prueba con `user_123:curso_7` en sandbox y después pide lo mismo en producción, hoy recibe 409 `external_ref_conflict` en lugar de pagar. Así no se paga dos veces ni se pierde la recompensa en silencio, pero obliga a los productos a usar referencias distintas en test. Alternativa: hacer la única `(product_id, env, external_ref)`. Requiere aprobación porque cambia una regla de idempotencia.
+
 ## 2026-11-23 — Cliente de Prepaynation y catálogo (paso 5)
 
 **Fuente:** especificación OpenAPI oficial (`/redocusaurus/api-v2.yaml`, enlazada desde el portal de desarrolladores de Valuetopup) y guías del portal (Transaction Flow, Authentication, Test Simulation).
