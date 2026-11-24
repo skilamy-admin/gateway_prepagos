@@ -11,6 +11,9 @@ LMS LearnDash…) hacia la API Valuetopup v2 de Prepaynation.
 Reglas de trabajo y del dominio: ver [`CLAUDE.md`](CLAUDE.md).
 Desvíos y decisiones: ver [`docs/decisiones.md`](docs/decisiones.md).
 
+Integración de servicios cliente: [`docs/client/`](docs/client/) — `integracion-agentes.md`
+(contrato técnico, para agentes) y `Guía de conexión al gateway.docx` (para personas).
+
 ## Desarrollo
 
 ```bash
